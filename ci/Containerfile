@@ -1,0 +1,22 @@
+FROM docker.io/library/debian:trixie
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+      pkg-config \
+      libgtk-4-dev \
+      libadwaita-1-dev \
+      libwebkitgtk-6.0-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain stable --profile minimal -c clippy,rustfmt --no-modify-path
+
+WORKDIR /wander

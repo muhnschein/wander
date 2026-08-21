@@ -1,0 +1,5 @@
+/target
+/flathub-build
+*.flatpak
+Cargo.lock.bak
+.DS_Store

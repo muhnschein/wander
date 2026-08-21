@@ -1,0 +1,22 @@
+[package]
+name = "wander"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Browse and read ZIM archives served by cairn"
+
+[[bin]]
+name = "wander"
+path = "src/main.rs"
+
+[dependencies]
+cairn-client = { path = "../cairn-client" }
+percent-encoding.workspace = true
+serde_json.workspace = true
+
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
+webkit = { package = "webkit6", version = "0.6" }
+glib = "0.22"
+gio = "0.22"
