@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Wander: a cairn, the stack of stones that marks the way. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#99c1f1"/>
+      <stop offset="1" stop-color="#dce9f8"/>
+    </linearGradient>
+    <linearGradient id="stone" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#c0bfbc"/>
+      <stop offset="1" stop-color="#77767b"/>
+    </linearGradient>
+    <linearGradient id="stoneWarm" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#cdab8f"/>
+      <stop offset="1" stop-color="#865e3c"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#sky)"/>
+
+  <!-- The path the walk follows, receding behind the cairn. -->
+  <path d="M8 104 C 40 100, 52 96, 64 92 C 78 96, 92 100, 120 104 L120 94
+           C 94 92, 78 88, 64 84 C 50 88, 34 92, 8 94 Z"
+        fill="#f6f5f4" opacity="0.55"/>
+
+  <g stroke="#3d3846" stroke-width="2.5" stroke-linejoin="round">
+    <ellipse cx="64" cy="99"  rx="34" ry="12" fill="url(#stone)"/>
+    <ellipse cx="61" cy="79"  rx="27" ry="11" fill="url(#stoneWarm)"/>
+    <ellipse cx="66" cy="61"  rx="21" ry="10" fill="url(#stone)"/>
+    <ellipse cx="62" cy="45"  rx="15" ry="8.5" fill="url(#stoneWarm)"/>
+    <ellipse cx="65" cy="32"  rx="10" ry="6.5" fill="url(#stone)"/>
+  </g>
+</svg>

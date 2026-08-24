@@ -73,6 +73,22 @@ Rust runs:
 $ cargo test -p cairn-client
 ```
 
+## Installing
+
+`make install` puts the binary, desktop entry, AppStream metainfo and icon
+where a desktop expects them. `PREFIX` and `DESTDIR` work as usual:
+
+```console
+$ sudo make install                 # into /usr/local
+$ make install DESTDIR=/tmp/stage   # staged, for packaging
+```
+
+Until those are installed the app still runs, but it has no launcher entry
+and no icon to resolve, so it appears under a generic one.
+
+`make check` runs everything CI runs: formatting, clippy, the tests, and
+validation of the desktop and metainfo files.
+
 ## Running
 
 Start `wander`, open the settings (gear icon) and enter the host and port of
@@ -85,6 +101,8 @@ usually `127.0.0.1:8080`; adjust to wherever the stones stand.
 |---|---|
 | `crates/cairn-client` | Headless HTTP client for the `cairn-api(7)` surface. No GTK linkage, fully unit-tested against a fake server. |
 | `crates/app` | The GTK4/libadwaita application: library, reader, settings, `cairn://` scheme handler. |
+
+Desktop entry, AppStream metainfo and the icon live in `data/`.
 
 ## Licence
 
