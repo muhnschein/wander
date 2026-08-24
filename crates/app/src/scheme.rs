@@ -1,8 +1,36 @@
 use cairn_client::CairnClient;
-use percent_encoding::percent_decode_str;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use std::sync::Arc;
 
 pub const SCHEME: &str = "cairn";
+
+/// Percent-encoding for the path portion of a `cairn://` URI.
+///
+/// Unlike the encoding the HTTP client applies, `/` is left alone. cairn takes
+/// an entry path as a single opaque segment, but a `cairn://` URI is a real URI
+/// that WebKit resolves relative links against: keeping the separators means a
+/// link to `Graben.html` inside `A/Vienna/Ring.html` resolves to
+/// `A/Vienna/Graben.html`, as the archive author intended. Encoding it to `%2F`
+/// would flatten every entry into the archive root and send each relative link
+/// to a path that does not exist.
+const URI_PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'/');
+
+/// Build the URI that addresses `path` within `uuid`.
+///
+/// Kept beside [`parse_target`] on purpose: the two are one format, and a
+/// change to either that the other does not match is exactly the defect the
+/// round-trip tests below exist to catch.
+pub fn entry_uri(uuid: &str, path: &str) -> String {
+    format!(
+        "{SCHEME}://{uuid}/{}",
+        utf8_percent_encode(path, URI_PATH_SET)
+    )
+}
 
 pub fn install(
     context: &webkit::WebContext,
@@ -148,6 +176,77 @@ mod tests {
             parse_target(&format!("cairn://{UUID}/A/What%3F.html")).as_deref(),
             Some("A/What?.html")
         );
+    }
+
+    /// The property the reader actually depends on: a relative link inside an
+    /// entry must resolve to a sibling of that entry.
+    ///
+    /// An encode-then-decode round trip cannot see this. Escaping `/` to `%2F`
+    /// survives that trip perfectly intact while still destroying relative
+    /// resolution, because a resolver then treats the whole path as one
+    /// segment. Resolution is checked against glib's RFC 3986 implementation
+    /// rather than a hand-rolled model of what WebKit is assumed to do.
+    #[test]
+    fn relative_links_resolve_to_siblings_of_the_entry() {
+        let base = super::entry_uri(UUID, "A/Vienna/Ring.html");
+        for (link, expected) in [
+            ("Graben.html", "A/Vienna/Graben.html"),
+            ("./Graben.html", "A/Vienna/Graben.html"),
+            ("../Salzburg/Dom.html", "A/Salzburg/Dom.html"),
+            ("/A/Wien.html", "A/Wien.html"),
+            ("Ring.html#History", "A/Vienna/Ring.html"),
+        ] {
+            let resolved = glib::Uri::resolve_relative(Some(&base), link, glib::UriFlags::NONE)
+                .expect("glib resolves the reference");
+            assert_eq!(
+                parse_target(&resolved).as_deref(),
+                Some(expected),
+                "{link:?} against {base:?} resolved to {resolved:?}"
+            );
+        }
+    }
+
+    /// Guards encode/decode symmetry only. Deliberately weaker than the test
+    /// above, and on its own it would not notice a change that breaks relative
+    /// links — both directions would simply agree on the wrong thing.
+    #[test]
+    fn built_uris_parse_back_to_the_same_path() {
+        for path in [
+            "index.html",
+            "A/Vienna/Ring.html",
+            "A/Wien Ä.html",
+            "A/Arts & Crafts.html",
+            "A/What?.html",
+            "A/100% Cotton.html",
+            "A/a#b.html",
+            "A/Ünïcödé/Straße~1.html",
+            "A/plus+sign.html",
+            "",
+        ] {
+            let uri = super::entry_uri(UUID, path);
+            assert_eq!(
+                parse_target(&uri).as_deref(),
+                Some(path),
+                "round trip failed for {path:?} (uri was {uri:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn separators_survive_encoding_so_relative_links_resolve() {
+        // The `/` must stay literal: WebKit resolves a relative link against
+        // the last path segment, so `%2F` would flatten the entry into the
+        // archive root and break every relative link on the page.
+        let uri = super::entry_uri(UUID, "A/Vienna/Ring.html");
+        assert_eq!(uri, format!("cairn://{UUID}/A/Vienna/Ring.html"));
+        assert!(!uri.contains("%2F"));
+    }
+
+    #[test]
+    fn characters_that_would_change_the_uri_shape_are_escaped() {
+        // Left literal these would truncate the path at the parser.
+        assert!(super::entry_uri(UUID, "A/What?.html").contains("%3F"));
+        assert!(super::entry_uri(UUID, "A/a#b.html").contains("%23"));
     }
 
     #[test]

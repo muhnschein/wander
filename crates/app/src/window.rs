@@ -367,3 +367,46 @@ fn open_settings(state: &Rc<State>) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::thousands;
+
+    #[test]
+    fn small_numbers_are_left_alone() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(7), "7");
+        assert_eq!(thousands(999), "999");
+    }
+
+    #[test]
+    fn groups_of_three_are_separated() {
+        // A narrow no-break space, so the count never wraps mid-number.
+        assert_eq!(thousands(1_000), "1\u{202f}000");
+        assert_eq!(thousands(20_317), "20\u{202f}317");
+        assert_eq!(thousands(1_000_000), "1\u{202f}000\u{202f}000");
+    }
+
+    #[test]
+    fn every_boundary_gets_exactly_one_separator() {
+        for (n, expected) in [
+            (999u64, 0usize),
+            (1_000, 1),
+            (999_999, 1),
+            (1_000_000, 2),
+            (u64::MAX, 6),
+        ] {
+            let formatted = thousands(n);
+            assert_eq!(
+                formatted.matches('\u{202f}').count(),
+                expected,
+                "{n} formatted as {formatted}"
+            );
+            // Separators are inserted, never substituted.
+            assert_eq!(
+                formatted.chars().filter(char::is_ascii_digit).count(),
+                n.to_string().len()
+            );
+        }
+    }
+}

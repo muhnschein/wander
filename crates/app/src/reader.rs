@@ -1,29 +1,12 @@
 use crate::scheme;
 use adw::prelude::*;
 use cairn_client::{ArchiveSummary, CairnClient};
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use webkit::prelude::*;
 
 const SUGGEST_LIMIT: u32 = 12;
-
-/// Percent-encoding for the path portion of a `cairn://` URI.
-///
-/// Unlike the encoding the HTTP client applies, `/` is left alone. cairn takes
-/// an entry path as a single opaque segment, but a `cairn://` URI is a real URI
-/// that WebKit resolves relative links against: keeping the separators means a
-/// link to `Graben.html` inside `A/Vienna/Ring.html` resolves to
-/// `A/Vienna/Graben.html`, as the archive author intended. Encoding it to `%2F`
-/// would flatten every entry into the archive root and send each relative link
-/// to a path that does not exist.
-const URI_PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'~')
-    .remove(b'/');
 
 pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::NavigationPage {
     let uuid = archive.uuid.clone();
@@ -279,9 +262,7 @@ fn ask_open_external(parent: &gtk::Window, uri: &str) {
 }
 
 fn load_entry(ui: &ReaderUi, path: &str) {
-    let encoded = utf8_percent_encode(path, URI_PATH_SET).to_string();
-    let uri = format!("{}://{}/{}", scheme::SCHEME, ui.uuid, encoded);
-    ui.view.load_uri(&uri);
+    ui.view.load_uri(&scheme::entry_uri(&ui.uuid, path));
 }
 
 /// Post a message on the window's toast overlay, if the widget is in one.
