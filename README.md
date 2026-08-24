@@ -28,7 +28,10 @@ GTK4 + libadwaita, written in Rust. Pre-alpha.
   (mode `0600` — what you have been reading is nobody else's business).
   History holds the last 500 entries; revisiting one moves it up rather
   than repeating it.
-- Title-prefix search in the open archive, wired to cairn's `/suggest`.
+- Title-prefix search across every open archive at once from the library,
+  and within the open archive while reading; both wired to cairn's
+  `/suggest`. Each archive is queried concurrently, so a search costs
+  about as long as the slowest one rather than the sum.
 - One random article, whenever you feel lucky.
 - External links are blocked by default and only opened after an explicit
   confirmation, via the system's URI launcher.

@@ -26,6 +26,12 @@ struct State {
     /// The last listing, so a history or bookmark row can find the archive it
     /// names. Reopening needs the summary, not just the uuid.
     archives: RefCell<Vec<ArchiveSummary>>,
+    search_list: gtk::ListBox,
+    /// What each row in `search_list` refers to, parallel by index.
+    hits: RefCell<Vec<Visit>>,
+    /// Discards a slower earlier query whose results would otherwise land on
+    /// top of a newer one.
+    search_generation: Cell<u64>,
 }
 
 impl std::ops::Deref for Window {
@@ -64,6 +70,11 @@ impl Window {
         saved_button.set_tooltip_text(Some("History and bookmarks"));
         header.pack_end(&saved_button);
 
+        let search_entry = gtk::SearchEntry::new();
+        search_entry.set_width_request(320);
+        search_entry.set_placeholder_text(Some("Search all archives…"));
+        header.set_title_widget(Some(&search_entry));
+
         let list = gtk::ListBox::new();
         list.set_css_classes(&["boxed-list"]);
         list.set_selection_mode(gtk::SelectionMode::None);
@@ -82,9 +93,21 @@ impl Window {
             .description("Point Wander at a cairn instance to browse its archives.")
             .build();
 
+        let search_list = gtk::ListBox::new();
+        search_list.set_css_classes(&["boxed-list"]);
+        search_list.set_selection_mode(gtk::SelectionMode::None);
+        search_list.set_margin_top(12);
+        search_list.set_margin_bottom(12);
+        search_list.set_margin_start(12);
+        search_list.set_margin_end(12);
+        let search_scrolled = gtk::ScrolledWindow::new();
+        search_scrolled.set_child(Some(&search_list));
+        search_scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+
         let stack = gtk::Stack::new();
         stack.add_named(&scrolled, Some("library"));
         stack.add_named(&status, Some("status"));
+        stack.add_named(&search_scrolled, Some("search"));
         stack.set_visible_child_name("status");
 
         // The header belongs to the library page, not to the window. Hung off
@@ -120,6 +143,9 @@ impl Window {
                 busy: Cell::new(false),
                 store: Rc::new(RefCell::new(Store::load())),
                 archives: RefCell::new(Vec::new()),
+                search_list,
+                hits: RefCell::new(Vec::new()),
+                search_generation: Cell::new(0),
             }),
         };
 
@@ -146,6 +172,31 @@ impl Window {
                 state.nav.push(&page);
             }
         });
+
+        let search_state = Rc::downgrade(&window.state);
+        search_entry.connect_search_changed(move |entry| {
+            if let Some(state) = search_state.upgrade() {
+                search_archives(&state, entry.text().trim().to_string());
+            }
+        });
+
+        let activate_state = Rc::downgrade(&window.state);
+        window
+            .state
+            .search_list
+            .connect_row_activated(move |_, row| {
+                let Some(state) = activate_state.upgrade() else {
+                    return;
+                };
+                let index = row.index();
+                if index < 0 {
+                    return;
+                }
+                let hit = state.hits.borrow().get(index as usize).cloned();
+                if let Some(hit) = hit {
+                    open_saved(&state, &hit);
+                }
+            });
 
         if let Some(config) = settings::load() {
             // Without this the library stays empty on every launch until the
@@ -300,6 +351,120 @@ fn archive_row(state: &Weak<State>, archive: ArchiveSummary) -> gtk::Widget {
     });
 
     row.upcast()
+}
+
+/// Per-archive cap. Twelve rows from one archive would bury every other.
+const HITS_PER_ARCHIVE: u32 = 5;
+
+/// Search every archive that supports suggestions, and show the hits together.
+///
+/// Each archive is queried on its own blocking task, so they run concurrently
+/// and the whole search costs about as long as the slowest one rather than the
+/// sum. Awaiting them in order just fixes the order results are shown in.
+fn search_archives(state: &Rc<State>, query: String) {
+    let generation = state.search_generation.get() + 1;
+    state.search_generation.set(generation);
+
+    if query.is_empty() {
+        clear_hits(state);
+        // Back to whichever view the library was showing before.
+        let restore = if state.list.first_child().is_some() {
+            "library"
+        } else {
+            "status"
+        };
+        state.stack.set_visible_child_name(restore);
+        return;
+    }
+
+    let Some(client) = state.client.borrow().clone() else {
+        return;
+    };
+    let searchable: Vec<ArchiveSummary> = state
+        .archives
+        .borrow()
+        .iter()
+        .filter(|a| a.suggest)
+        .cloned()
+        .collect();
+    if searchable.is_empty() {
+        clear_hits(state);
+        show_status(
+            state,
+            "system-search-symbolic",
+            "No archive can be searched",
+            "cairn offers suggestions only for archives built with a title index.",
+        );
+        return;
+    }
+
+    let weak = Rc::downgrade(state);
+    glib::spawn_future_local(async move {
+        let pending: Vec<_> = searchable
+            .into_iter()
+            .map(|archive| {
+                let client = client.clone();
+                let query = query.clone();
+                let uuid = archive.uuid.clone();
+                let task =
+                    gio::spawn_blocking(move || client.suggest(&uuid, &query, HITS_PER_ARCHIVE));
+                (archive, task)
+            })
+            .collect();
+
+        let mut hits = Vec::new();
+        for (archive, task) in pending {
+            if let Ok(Ok(suggestions)) = task.await {
+                hits.extend(suggestions.into_iter().map(|s| Visit {
+                    uuid: archive.uuid.clone(),
+                    path: s.path,
+                    title: s.title,
+                    archive_title: archive.title.clone(),
+                    at: 0,
+                }));
+            }
+        }
+
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        if state.search_generation.get() != generation {
+            return;
+        }
+        show_hits(&state, hits);
+    });
+}
+
+fn clear_hits(state: &Rc<State>) {
+    while let Some(child) = state.search_list.first_child() {
+        state.search_list.remove(&child);
+    }
+    state.hits.borrow_mut().clear();
+}
+
+fn show_hits(state: &Rc<State>, hits: Vec<Visit>) {
+    clear_hits(state);
+    if hits.is_empty() {
+        show_status(
+            state,
+            "system-search-symbolic",
+            "No matching entries",
+            "cairn matches on title prefixes, so try the start of a title.",
+        );
+        return;
+    }
+    let mut known = state.hits.borrow_mut();
+    for hit in hits {
+        // Markup off before any archive-supplied text, as everywhere else.
+        let row = adw::ActionRow::builder().activatable(true).build();
+        row.set_use_markup(false);
+        row.set_title(&hit.title);
+        row.set_subtitle(&hit.archive_title);
+        state.search_list.append(&row);
+        known.push(hit);
+    }
+    drop(known);
+    state.stack.set_visible_child_name("search");
 }
 
 /// Push a reader for `archive`, optionally opening a particular entry.
