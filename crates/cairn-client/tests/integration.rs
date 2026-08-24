@@ -427,3 +427,291 @@ fn malformed_error_body_still_yields_api_error() {
         other => panic!("expected Api error, got {other:?}"),
     }
 }
+
+#[test]
+fn ipv6_hosts_are_bracketed_in_the_base_url() {
+    let client = CairnClient::new("::1", 8080, None).expect("ipv6 host");
+    assert_eq!(client.base_url(), "http://[::1]:8080");
+
+    let already = CairnClient::new("[2001:db8::7]", 8080, None).expect("bracketed ipv6");
+    assert_eq!(already.base_url(), "http://[2001:db8::7]:8080");
+}
+
+#[test]
+fn ordinary_hosts_pass_through_untouched() {
+    let client = CairnClient::new("  cairn.example.org  ", 9000, None).expect("host");
+    assert_eq!(client.base_url(), "http://cairn.example.org:9000");
+}
+
+#[test]
+fn hosts_cannot_smuggle_url_syntax() {
+    // Userinfo would move the effective host past the `@`, pointing every
+    // request somewhere the user never configured.
+    for bad in [
+        "user@evil.example",
+        "127.0.0.1/../..",
+        "127.0.0.1:9999",
+        "host?q=1",
+        "host#frag",
+        "has space",
+        "",
+        "   ",
+    ] {
+        assert!(
+            matches!(CairnClient::new(bad, 8080, None), Err(Error::Invalid(_))),
+            "expected {bad:?} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn status_backed_code_when_body_is_not_a_cairn_envelope() {
+    // A proxy in front of cairn answers with its own 404 body; `is_not_found`
+    // must still recognise a missing entry.
+    let server = serve(|_| Response::json(404, "<html>nginx</html>"));
+    let err = client(&server.addr).archives().expect_err("must fail");
+    assert!(err.is_not_found(), "got {err}");
+    assert_eq!(err.status(), Some(404));
+
+    let server = serve(|_| Response::json(401, r#"{"detail":"nope"}"#));
+    let err = client(&server.addr).archives().expect_err("must fail");
+    assert!(err.is_unauthorized(), "got {err}");
+}
+
+#[test]
+fn base_url_loses_its_trailing_slashes() {
+    // Left on, every request path would carry a double slash.
+    let client = CairnClient::with_base_url("http://example.org:8080///", None);
+    assert_eq!(client.base_url(), "http://example.org:8080");
+}
+
+#[test]
+fn a_whitespace_only_token_is_no_token() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let seen = counter.clone();
+    let server = serve(move |req| {
+        if req.header("authorization").is_some() {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }
+        Response::json(200, ARCHIVES_JSON)
+    });
+    CairnClient::with_base_url(&format!("http://{}", server.addr), Some("   "))
+        .archives()
+        .expect("archives");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "a blank token must not produce an Authorization header"
+    );
+}
+
+#[test]
+fn suggest_limit_is_clamped_into_range() {
+    for (asked, expected) in [(0u32, 1u32), (1, 1), (12, 12), (32, 32), (999, 32)] {
+        let server = serve(move |req| {
+            assert!(
+                req.target.ends_with(&format!("&limit={expected}")),
+                "limit {asked} produced {}",
+                req.target
+            );
+            Response::json(200, r#"{"suggestions":[]}"#)
+        });
+        client(&server.addr)
+            .suggest(UUID, "wien", asked)
+            .expect("suggest");
+    }
+}
+
+#[test]
+fn entry_falls_back_when_the_daemon_omits_headers() {
+    let server = serve(|_| Response {
+        status: 200,
+        headers: Vec::new(),
+        body: b"raw".to_vec(),
+        is_head: false,
+    });
+    let entry = client(&server.addr)
+        .entry(UUID, "A/Asked.html")
+        .expect("entry");
+    assert_eq!(entry.content_type, "application/octet-stream");
+    // Without X-Cairn-Path the requested path is the best answer available.
+    assert_eq!(entry.path, "A/Asked.html");
+    assert_eq!(entry.archive, UUID);
+}
+
+#[test]
+fn a_malformed_content_length_fails_the_request() {
+    // Documents where the validation actually happens: ureq rejects a junk
+    // Content-Length itself, so `EntryMeta::length` never sees one. Its
+    // `Option` is defence against a header the transport already refuses to
+    // pass on, not against a value this crate has to interpret.
+    let server = serve(|_| Response {
+        status: 200,
+        headers: vec![
+            ("Content-Type".into(), "text/html".into()),
+            ("Content-Length".into(), "banana".into()),
+        ],
+        body: Vec::new(),
+        is_head: true,
+    });
+    let err = client(&server.addr)
+        .entry_meta(UUID, "A/X.html")
+        .expect_err("must fail");
+    assert!(
+        matches!(err, Error::Transport(_)),
+        "expected Transport, got {err:?}"
+    );
+}
+
+#[test]
+fn entry_meta_surfaces_a_missing_entry() {
+    let server = serve(|_| Response::error(404, "not_found"));
+    let err = client(&server.addr)
+        .entry_meta(UUID, "A/Gone.html")
+        .expect_err("must fail");
+    assert!(err.is_not_found(), "got {err}");
+}
+
+#[test]
+fn a_refused_connection_is_a_transport_error() {
+    // Port 9 (discard) is closed on the loopback of a normal test host.
+    let err = CairnClient::new("127.0.0.1", 9, None)
+        .expect("client")
+        .archives()
+        .expect_err("must fail");
+    assert!(
+        matches!(err, Error::Transport(_)),
+        "expected Transport, got {err:?}"
+    );
+    assert_eq!(err.status(), None);
+}
+
+#[test]
+fn a_success_body_that_is_not_json_is_an_invalid_response() {
+    let server = serve(|_| Response::json(200, "<html>hello</html>"));
+    let err = client(&server.addr).archives().expect_err("must fail");
+    assert!(
+        matches!(err, Error::Invalid(_)),
+        "expected Invalid, got {err:?}"
+    );
+}
+
+#[test]
+fn uuids_are_rejected_before_a_request_in_every_malformed_shape() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c2 = counter.clone();
+    let server = serve(move |_| {
+        c2.fetch_add(1, Ordering::SeqCst);
+        Response::json(200, "{}")
+    });
+    let c = client(&server.addr);
+    for bad in [
+        "",
+        "b10db2a4",
+        "b10db2a4-0aac-52db-fd17-c5f79f36ab9",   // too short
+        "b10db2a4-0aac-52db-fd17-c5f79f36ab966", // too long
+        "b10db2a40aac52dbfd17c5f79f36ab96",      // no hyphens
+        "b10db2a4-0aac-52db-fd17-c5f79f36ab9g",  // non-hex
+        "b10db2a4-0aac-52db-fd17-C5F79F36AB96",  // uppercase
+        "b10db2a40-aac-52db-fd17-c5f79f36ab96",  // hyphens misplaced
+    ] {
+        assert!(
+            matches!(c.archive(bad), Err(Error::Invalid(_))),
+            "expected {bad:?} to be rejected"
+        );
+        assert!(matches!(c.entry(bad, "X"), Err(Error::Invalid(_))));
+        assert!(matches!(c.random(bad), Err(Error::Invalid(_))));
+        assert!(matches!(c.suggest(bad, "q", 5), Err(Error::Invalid(_))));
+    }
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "no request may be sent");
+}
+
+#[test]
+fn an_empty_library_is_not_an_error() {
+    let server = serve(|_| Response::json(200, r#"{"archives":[]}"#));
+    assert!(
+        client(&server.addr)
+            .archives()
+            .expect("archives")
+            .is_empty()
+    );
+}
+
+#[test]
+fn optional_archive_fields_may_all_be_absent() {
+    // Every field but uuid and title is `#[serde(default)]`; a lean daemon
+    // response must not fail to parse.
+    let server = serve(|_| {
+        Response::json(
+            200,
+            r#"{"archives":[{"uuid":"b10db2a4-0aac-52db-fd17-c5f79f36ab96","title":"Bare"}]}"#,
+        )
+    });
+    let archives = client(&server.addr).archives().expect("archives");
+    let bare = &archives[0];
+    assert_eq!(bare.title, "Bare");
+    assert_eq!(bare.entry_count, 0);
+    assert_eq!(bare.main_page, None);
+    assert_eq!(bare.cluster_count, None);
+    assert!(!bare.suggest);
+}
+
+#[test]
+fn an_over_long_query_is_trimmed_rather_than_rejected() {
+    // cairn bounds `q` by suggest_max_query (128) and answers bad_query past
+    // it. Trimming keeps a prefix search working instead of round-tripping to
+    // a guaranteed error.
+    let server = serve(|req| {
+        let q = req
+            .target
+            .split("q=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .expect("query");
+        // Percent-encoded, so every byte of a plain ASCII query is one char.
+        assert_eq!(
+            q.len(),
+            128,
+            "query was not trimmed to the documented bound"
+        );
+        Response::json(200, r#"{"suggestions":[]}"#)
+    });
+    let long = "a".repeat(500);
+    client(&server.addr)
+        .suggest(UUID, &long, 5)
+        .expect("suggest");
+}
+
+#[test]
+fn trimming_a_query_never_splits_a_character() {
+    // 43 three-byte characters is 129 bytes: the cut lands mid-character
+    // unless the boundary is respected.
+    let server = serve(|_| Response::json(200, r#"{"suggestions":[]}"#));
+    let long = "日".repeat(43);
+    assert_eq!(long.len(), 129);
+    // Panicking on a non-boundary slice would fail the call, not just the assert.
+    client(&server.addr)
+        .suggest(UUID, &long, 5)
+        .expect("suggest");
+}
+
+#[test]
+fn status_carries_the_daemons_advertised_limits() {
+    let server = serve(|_| {
+        Response::json(
+            200,
+            r#"{"version":"2026.08","limits":{"suggest_max_query":64,"suggest_max_results":8}}"#,
+        )
+    });
+    let status = client(&server.addr).status().expect("status");
+    assert_eq!(status.limits.suggest_max_query, 64);
+    assert_eq!(status.limits.suggest_max_results, 8);
+}
+
+#[test]
+fn a_daemon_that_reports_no_limits_still_yields_the_documented_ones() {
+    let server = serve(|_| Response::json(200, r#"{"version":"2026.08"}"#));
+    let status = client(&server.addr).status().expect("status");
+    assert_eq!(status.limits.suggest_max_query, 128);
+    assert_eq!(status.limits.suggest_max_results, 32);
+}

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Wander
+GenericName=ZIM Archive Reader
+Comment=Browse and read ZIM archives served by cairn
+Exec=wander
+Icon=io.github.muhnschein.Wander
+Terminal=false
+Categories=GTK;Office;Viewer;
+Keywords=ZIM;archive;offline;encyclopedia;wikipedia;cairn;reader;
+StartupNotify=true

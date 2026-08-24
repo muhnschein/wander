@@ -1,8 +1,9 @@
 use crate::settings::{self, ServerConfig};
+use crate::store::{Store, Visit};
 use adw::prelude::*;
 use cairn_client::{ArchiveSummary, CairnClient};
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 pub struct Window {
@@ -15,7 +16,22 @@ struct State {
     nav: adw::NavigationView,
     list: gtk::ListBox,
     stack: gtk::Stack,
+    status: adw::StatusPage,
+    spinner: gtk::Spinner,
     toasts: adw::ToastOverlay,
+    /// Guards against a second listing racing the first when refresh is
+    /// clicked repeatedly; the later response would otherwise win arbitrarily.
+    busy: Cell<bool>,
+    store: Rc<RefCell<Store>>,
+    /// The last listing, so a history or bookmark row can find the archive it
+    /// names. Reopening needs the summary, not just the uuid.
+    archives: RefCell<Vec<ArchiveSummary>>,
+    search_list: gtk::ListBox,
+    /// What each row in `search_list` refers to, parallel by index.
+    hits: RefCell<Vec<Visit>>,
+    /// Discards a slower earlier query whose results would otherwise land on
+    /// top of a newer one.
+    search_generation: Cell<u64>,
 }
 
 impl std::ops::Deref for Window {
@@ -42,9 +58,22 @@ impl Window {
         refresh_button.set_tooltip_text(Some("Refresh library"));
         header.pack_start(&refresh_button);
 
+        let spinner = gtk::Spinner::new();
+        spinner.set_visible(false);
+        header.pack_start(&spinner);
+
         let prefs_button = gtk::Button::from_icon_name("emblem-system-symbolic");
         prefs_button.set_tooltip_text(Some("Server settings"));
         header.pack_end(&prefs_button);
+
+        let saved_button = gtk::Button::from_icon_name("user-bookmarks-symbolic");
+        saved_button.set_tooltip_text(Some("History and bookmarks"));
+        header.pack_end(&saved_button);
+
+        let search_entry = gtk::SearchEntry::new();
+        search_entry.set_width_request(320);
+        search_entry.set_placeholder_text(Some("Search all archives…"));
+        header.set_title_widget(Some(&search_entry));
 
         let list = gtk::ListBox::new();
         list.set_css_classes(&["boxed-list"]);
@@ -58,32 +87,48 @@ impl Window {
         scrolled.set_child(Some(&list));
         scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
 
-        let status_page = adw::StatusPage::builder()
+        let status = adw::StatusPage::builder()
             .icon_name("system-search-symbolic")
             .title("Nothing to show yet")
             .description("Point Wander at a cairn instance to browse its archives.")
             .build();
 
+        let search_list = gtk::ListBox::new();
+        search_list.set_css_classes(&["boxed-list"]);
+        search_list.set_selection_mode(gtk::SelectionMode::None);
+        search_list.set_margin_top(12);
+        search_list.set_margin_bottom(12);
+        search_list.set_margin_start(12);
+        search_list.set_margin_end(12);
+        let search_scrolled = gtk::ScrolledWindow::new();
+        search_scrolled.set_child(Some(&search_list));
+        search_scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+
         let stack = gtk::Stack::new();
         stack.add_named(&scrolled, Some("library"));
-        stack.add_named(&status_page, Some("status"));
+        stack.add_named(&status, Some("status"));
+        stack.add_named(&search_scrolled, Some("search"));
         stack.set_visible_child_name("status");
+
+        // The header belongs to the library page, not to the window. Hung off
+        // the window it stays put while a reader page is pushed over it,
+        // leaving two stacked header bars, two sets of window controls, and a
+        // refresh button for a library nobody is looking at.
+        let library_toolbar = adw::ToolbarView::new();
+        library_toolbar.add_top_bar(&header);
+        library_toolbar.set_content(Some(&stack));
 
         let nav = adw::NavigationView::new();
         let library_page = adw::NavigationPage::builder()
             .title("Wander")
-            .child(&stack)
+            .child(&library_toolbar)
             .build();
         nav.add(&library_page);
 
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&nav));
 
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&header);
-        toolbar.set_content(Some(&toasts));
-
-        win.set_content(Some(&toolbar));
+        win.set_content(Some(&toasts));
 
         let window = Self {
             win,
@@ -92,22 +137,73 @@ impl Window {
                 nav,
                 list,
                 stack,
+                status,
+                spinner,
                 toasts,
+                busy: Cell::new(false),
+                store: Rc::new(RefCell::new(Store::load())),
+                archives: RefCell::new(Vec::new()),
+                search_list,
+                hits: RefCell::new(Vec::new()),
+                search_generation: Cell::new(0),
             }),
         };
 
-        let refresh_state = window.state.clone();
+        // These closures live on widgets that the state itself owns, so they
+        // hold a weak reference; a strong one would make the window immortal.
+        let refresh_state = Rc::downgrade(&window.state);
         refresh_button.connect_clicked(move |_| {
-            refresh_library(&refresh_state);
+            if let Some(state) = refresh_state.upgrade() {
+                refresh_library(&state);
+            }
         });
 
-        let prefs_state = window.state.clone();
+        let prefs_state = Rc::downgrade(&window.state);
         prefs_button.connect_clicked(move |_| {
-            open_settings(&prefs_state);
+            if let Some(state) = prefs_state.upgrade() {
+                open_settings(&state);
+            }
         });
+
+        let saved_state = Rc::downgrade(&window.state);
+        saved_button.connect_clicked(move |_| {
+            if let Some(state) = saved_state.upgrade() {
+                let page = saved_page(&state);
+                state.nav.push(&page);
+            }
+        });
+
+        let search_state = Rc::downgrade(&window.state);
+        search_entry.connect_search_changed(move |entry| {
+            if let Some(state) = search_state.upgrade() {
+                search_archives(&state, entry.text().trim().to_string());
+            }
+        });
+
+        let activate_state = Rc::downgrade(&window.state);
+        window
+            .state
+            .search_list
+            .connect_row_activated(move |_, row| {
+                let Some(state) = activate_state.upgrade() else {
+                    return;
+                };
+                let index = row.index();
+                if index < 0 {
+                    return;
+                }
+                let hit = state.hits.borrow().get(index as usize).cloned();
+                if let Some(hit) = hit {
+                    open_saved(&state, &hit);
+                }
+            });
 
         if let Some(config) = settings::load() {
-            apply_config(&window.state, &config);
+            // Without this the library stays empty on every launch until the
+            // user thinks to press refresh, even with a working saved server.
+            if apply_config(&window.state, &config) {
+                refresh_library(&window.state);
+            }
         }
 
         window
@@ -116,14 +212,28 @@ impl Window {
     pub fn open_settings(&self) {
         open_settings(&self.state);
     }
+
+    /// Whether the saved settings produced a usable client. False when nothing
+    /// is stored yet and also when what is stored no longer parses.
+    pub fn is_configured(&self) -> bool {
+        self.state.client.borrow().is_some()
+    }
 }
 
-fn apply_config(state: &State, config: &ServerConfig) {
+/// Point the window at `config`. Returns whether a usable client came of it.
+fn apply_config(state: &State, config: &ServerConfig) -> bool {
     match CairnClient::new(&config.host, config.port, config.token.as_deref()) {
         Ok(client) => {
             *state.client.borrow_mut() = Some(Arc::new(client));
+            true
         }
-        Err(err) => toast(state, &err.to_string()),
+        Err(err) => {
+            // Dropping the old client matters: keeping it would leave the
+            // window browsing the previous server while showing the new one.
+            *state.client.borrow_mut() = None;
+            toast(state, &err.to_string());
+            false
+        }
     }
 }
 
@@ -133,85 +243,404 @@ fn toast(state: &State, message: &str) {
         .add_toast(adw::Toast::builder().title(message).timeout(4).build());
 }
 
+fn show_status(state: &State, icon: &str, title: &str, description: &str) {
+    state.status.set_icon_name(Some(icon));
+    state.status.set_title(title);
+    state.status.set_description(Some(description));
+    state.stack.set_visible_child_name("status");
+}
+
 fn refresh_library(state: &Rc<State>) {
-    while let Some(child) = state.list.first_child() {
-        state.list.remove(&child);
-    }
     let Some(client) = state.client.borrow().clone() else {
-        state.stack.set_visible_child_name("status");
+        show_status(
+            state,
+            "system-search-symbolic",
+            "No server configured",
+            "Open the settings and point Wander at a cairn instance.",
+        );
         return;
     };
-    state.stack.set_visible_child_name("library");
+    if state.busy.replace(true) {
+        return;
+    }
+    state.spinner.set_visible(true);
+    state.spinner.set_spinning(true);
 
-    let weak_list = state.list.downgrade();
-    let weak_stack = state.stack.downgrade();
-    let state_for_error = Rc::downgrade(state);
-
+    let weak = Rc::downgrade(state);
     glib::spawn_future_local(async move {
         let fetched = gio::spawn_blocking(move || client.archives()).await;
-        let (Some(list), Some(stack)) = (weak_list.upgrade(), weak_stack.upgrade()) else {
+        let Some(state) = weak.upgrade() else {
             return;
         };
+        state.busy.set(false);
+        state.spinner.set_spinning(false);
+        state.spinner.set_visible(false);
+
         match fetched {
             Ok(Ok(archives)) => {
+                clear_list(&state);
+                if archives.is_empty() {
+                    show_status(
+                        &state,
+                        "folder-symbolic",
+                        "No open archives",
+                        "The server is reachable but has no archives open.",
+                    );
+                    return;
+                }
+                *state.archives.borrow_mut() = archives.clone();
+                let weak = Rc::downgrade(&state);
                 for archive in archives {
-                    list.append(&archive_row(&state_for_error, archive));
+                    state.list.append(&archive_row(&weak, archive));
                 }
-                if list.first_child().is_none() {
-                    stack.set_visible_child_name("status");
-                    if let Some(state) = state_for_error.upgrade() {
-                        toast(&state, "The server is reachable but has no open archives.");
-                    }
-                }
+                state.stack.set_visible_child_name("library");
             }
-            Ok(Err(err)) => {
-                stack.set_visible_child_name("status");
-                if let Some(state) = state_for_error.upgrade() {
-                    toast(&state, &err.to_string());
-                }
-            }
-            Err(_) => {
-                stack.set_visible_child_name("status");
-                if let Some(state) = state_for_error.upgrade() {
-                    toast(&state, "Background task failed.");
-                }
-            }
+            Ok(Err(err)) => report_refresh_failure(&state, &err.to_string()),
+            Err(_) => report_refresh_failure(&state, "Background task failed."),
         }
     });
 }
 
-fn archive_row(state: &std::rc::Weak<State>, archive: ArchiveSummary) -> gtk::Widget {
+/// A failed refresh keeps whatever the library already showed — a stale listing
+/// beats an empty window — and only takes over the view when there is nothing
+/// left to preserve.
+fn report_refresh_failure(state: &Rc<State>, message: &str) {
+    if state.list.first_child().is_some() {
+        toast(state, message);
+    } else {
+        show_status(
+            state,
+            "network-error-symbolic",
+            "Cannot reach cairn",
+            message,
+        );
+    }
+}
+
+fn clear_list(state: &State) {
+    while let Some(child) = state.list.first_child() {
+        state.list.remove(&child);
+    }
+}
+
+fn archive_row(state: &Weak<State>, archive: ArchiveSummary) -> gtk::Widget {
+    let mut subtitle = format!("{} entries", thousands(archive.entry_count));
+    if archive.suggest {
+        subtitle.push_str(" · searchable");
+    }
+
+    // Titles come out of the ZIM file, and an ActionRow renders them as Pango
+    // markup by default: an archive called "Arts & Crafts" fails to parse and
+    // renders empty. Markup has to be turned off *before* the title is set —
+    // supplying it to the builder means it is parsed on the way in, warning and
+    // mangling the text before any later call can take effect.
     let row = adw::ActionRow::builder()
-        .title(&archive.title)
-        .subtitle(format!(
-            "{} · {} entries",
-            archive.uuid, archive.entry_count
-        ))
+        .subtitle(subtitle)
         .activatable(true)
         .build();
-
-    let suffix = gtk::Label::new(None);
-    suffix.set_text(if archive.suggest { "searchable" } else { "" });
-    suffix.add_css_class("dim-label");
-    row.add_suffix(&suffix);
+    row.set_use_markup(false);
+    row.set_title(&archive.title);
+    row.set_tooltip_text(Some(&archive.uuid));
 
     let state = state.clone();
     row.connect_activated(move |_| {
         let Some(state) = state.upgrade() else {
             return;
         };
-        let Some(client) = state.client.borrow().clone() else {
-            return;
-        };
-        let page = crate::reader::reader_page(client, archive.clone());
-        state.nav.push(&page);
+        open_entry(&state, &archive, None);
     });
 
     row.upcast()
 }
 
+/// Per-archive cap. Twelve rows from one archive would bury every other.
+const HITS_PER_ARCHIVE: u32 = 5;
+
+/// Search every archive that supports suggestions, and show the hits together.
+///
+/// Each archive is queried on its own blocking task, so they run concurrently
+/// and the whole search costs about as long as the slowest one rather than the
+/// sum. Awaiting them in order just fixes the order results are shown in.
+fn search_archives(state: &Rc<State>, query: String) {
+    let generation = state.search_generation.get() + 1;
+    state.search_generation.set(generation);
+
+    if query.is_empty() {
+        clear_hits(state);
+        // Back to whichever view the library was showing before.
+        let restore = if state.list.first_child().is_some() {
+            "library"
+        } else {
+            "status"
+        };
+        state.stack.set_visible_child_name(restore);
+        return;
+    }
+
+    let Some(client) = state.client.borrow().clone() else {
+        return;
+    };
+    let searchable: Vec<ArchiveSummary> = state
+        .archives
+        .borrow()
+        .iter()
+        .filter(|a| a.suggest)
+        .cloned()
+        .collect();
+    if searchable.is_empty() {
+        clear_hits(state);
+        show_status(
+            state,
+            "system-search-symbolic",
+            "No archive can be searched",
+            "cairn offers suggestions only for archives built with a title index.",
+        );
+        return;
+    }
+
+    let weak = Rc::downgrade(state);
+    glib::spawn_future_local(async move {
+        let pending: Vec<_> = searchable
+            .into_iter()
+            .map(|archive| {
+                let client = client.clone();
+                let query = query.clone();
+                let uuid = archive.uuid.clone();
+                let task =
+                    gio::spawn_blocking(move || client.suggest(&uuid, &query, HITS_PER_ARCHIVE));
+                (archive, task)
+            })
+            .collect();
+
+        let mut hits = Vec::new();
+        for (archive, task) in pending {
+            if let Ok(Ok(suggestions)) = task.await {
+                hits.extend(suggestions.into_iter().map(|s| Visit {
+                    uuid: archive.uuid.clone(),
+                    path: s.path,
+                    title: s.title,
+                    archive_title: archive.title.clone(),
+                    at: 0,
+                }));
+            }
+        }
+
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        if state.search_generation.get() != generation {
+            return;
+        }
+        show_hits(&state, hits);
+    });
+}
+
+fn clear_hits(state: &Rc<State>) {
+    while let Some(child) = state.search_list.first_child() {
+        state.search_list.remove(&child);
+    }
+    state.hits.borrow_mut().clear();
+}
+
+fn show_hits(state: &Rc<State>, hits: Vec<Visit>) {
+    clear_hits(state);
+    if hits.is_empty() {
+        show_status(
+            state,
+            "system-search-symbolic",
+            "No matching entries",
+            // cairn-api(7): matching is byte-exact on the stored title, with no
+            // case or diacritic folding, which is surprising enough to say out
+            // loud rather than leave someone retyping a lowercase query.
+            "cairn matches the start of a title exactly, including capitals and accents.",
+        );
+        return;
+    }
+    let mut known = state.hits.borrow_mut();
+    for hit in hits {
+        // Markup off before any archive-supplied text, as everywhere else.
+        let row = adw::ActionRow::builder().activatable(true).build();
+        row.set_use_markup(false);
+        row.set_title(&hit.title);
+        row.set_subtitle(&hit.archive_title);
+        state.search_list.append(&row);
+        known.push(hit);
+    }
+    drop(known);
+    state.stack.set_visible_child_name("search");
+}
+
+/// Push a reader for `archive`, optionally opening a particular entry.
+fn open_entry(state: &Rc<State>, archive: &ArchiveSummary, path: Option<String>) {
+    let Some(client) = state.client.borrow().clone() else {
+        return;
+    };
+    let page = crate::reader::reader_page(client, archive.clone(), state.store.clone(), path);
+    state.nav.push(&page);
+}
+
+/// A saved row names its archive by uuid, which is only reopenable while that
+/// archive is still one the daemon has open.
+fn open_saved(state: &Rc<State>, visit: &Visit) {
+    let archive = state
+        .archives
+        .borrow()
+        .iter()
+        .find(|a| a.uuid == visit.uuid)
+        .cloned();
+    match archive {
+        Some(archive) => open_entry(state, &archive, Some(visit.path.clone())),
+        None => toast(
+            state,
+            &format!(
+                "{} is not open on this server any more.",
+                visit.archive_title
+            ),
+        ),
+    }
+}
+
+/// History and bookmarks, side by side.
+fn saved_page(state: &Rc<State>) -> adw::NavigationPage {
+    let stack = adw::ViewStack::new();
+
+    let history = saved_list(
+        state,
+        state.store.borrow().history(),
+        "No history yet",
+        "Entries you open are listed here.",
+    );
+    let bookmarks = saved_list(
+        state,
+        state.store.borrow().bookmarks(),
+        "No bookmarks yet",
+        "Star an entry while reading to keep it here.",
+    );
+    stack.add_titled_with_icon(
+        &history,
+        Some("history"),
+        "History",
+        "document-open-recent-symbolic",
+    );
+    stack.add_titled_with_icon(
+        &bookmarks,
+        Some("bookmarks"),
+        "Bookmarks",
+        "user-bookmarks-symbolic",
+    );
+
+    let header = adw::HeaderBar::new();
+    let switcher = adw::ViewSwitcher::builder()
+        .stack(&stack)
+        .policy(adw::ViewSwitcherPolicy::Wide)
+        .build();
+    header.set_title_widget(Some(&switcher));
+
+    let clear = gtk::Button::from_icon_name("user-trash-symbolic");
+    clear.set_tooltip_text(Some("Clear history"));
+    header.pack_end(&clear);
+
+    let clear_state = Rc::downgrade(state);
+    let clear_stack = stack.clone();
+    clear.connect_clicked(move |_| {
+        let Some(state) = clear_state.upgrade() else {
+            return;
+        };
+        state.store.borrow_mut().clear_history();
+        state.store.borrow().save();
+        // Rebuild in place so the emptied list is visible immediately.
+        let refreshed = saved_list(
+            &state,
+            &[],
+            "No history yet",
+            "Entries you open are listed here.",
+        );
+        if let Some(old) = clear_stack.child_by_name("history") {
+            clear_stack.remove(&old);
+        }
+        clear_stack.add_titled_with_icon(
+            &refreshed,
+            Some("history"),
+            "History",
+            "document-open-recent-symbolic",
+        );
+        clear_stack.set_visible_child_name("history");
+        toast(&state, "History cleared.");
+    });
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&stack));
+
+    adw::NavigationPage::builder()
+        .title("Saved")
+        .child(&toolbar)
+        .build()
+}
+
+fn saved_list(
+    state: &Rc<State>,
+    visits: &[Visit],
+    empty_title: &str,
+    empty_body: &str,
+) -> gtk::Widget {
+    if visits.is_empty() {
+        return adw::StatusPage::builder()
+            .icon_name("document-open-recent-symbolic")
+            .title(empty_title)
+            .description(empty_body)
+            .build()
+            .upcast();
+    }
+
+    let list = gtk::ListBox::new();
+    list.set_css_classes(&["boxed-list"]);
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.set_margin_top(12);
+    list.set_margin_bottom(12);
+    list.set_margin_start(12);
+    list.set_margin_end(12);
+
+    for visit in visits {
+        // Markup off before any archive-supplied text, as everywhere else.
+        let row = adw::ActionRow::builder().activatable(true).build();
+        row.set_use_markup(false);
+        row.set_title(&visit.title);
+        row.set_subtitle(&format!("{} · {}", visit.archive_title, visit.path));
+
+        let weak = Rc::downgrade(state);
+        let visit = visit.clone();
+        row.connect_activated(move |_| {
+            if let Some(state) = weak.upgrade() {
+                open_saved(&state, &visit);
+            }
+        });
+        list.append(&row);
+    }
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_child(Some(&list));
+    scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scrolled.set_vexpand(true);
+    scrolled.upcast()
+}
+
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push('\u{202f}');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn open_settings(state: &Rc<State>) {
     let existing = settings::load().unwrap_or_default();
+    let previous_host = existing.host.clone();
+    let previous_port = existing.port;
 
     let dialog = adw::PreferencesDialog::new();
     dialog.set_title("Cairn server");
@@ -240,19 +669,34 @@ fn open_settings(state: &Rc<State>) {
     page.add(&group);
     dialog.add(&page);
 
-    let host_row = host_row.clone();
-    let port_row = port_row.clone();
-    let token_row = token_row.clone();
-    let state = state.clone();
+    let state = Rc::downgrade(state);
     dialog.connect_closed(move |_| {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+
+        // A rejected field falls back to the previous value rather than
+        // abandoning the whole edit: returning early here used to discard a
+        // corrected host because the port next to it had a typo.
         let host = host_row.text().trim().to_string();
+        let host = if host.is_empty() {
+            toast(&state, "Host must not be empty; keeping the previous one.");
+            previous_host.clone()
+        } else {
+            host
+        };
+
         let port = match port_row.text().trim().parse::<u16>() {
-            Ok(port) => port,
-            Err(_) => {
-                toast(&state, "Port must be a number between 0 and 65535.");
-                return;
+            Ok(port) if port > 0 => port,
+            _ => {
+                toast(
+                    &state,
+                    &format!("Port must be between 1 and 65535; keeping {previous_port}."),
+                );
+                previous_port
             }
         };
+
         let token = token_row.text().trim().to_string();
         let token = (!token.is_empty()).then_some(token);
 
@@ -262,8 +706,52 @@ fn open_settings(state: &Rc<State>) {
             token,
         };
         settings::save(&config);
-        apply_config(&state, &config);
-        toast(&state, &format!("Saved. Connecting to {host}:{port}…"));
-        refresh_library(&state);
+        if apply_config(&state, &config) {
+            toast(&state, &format!("Connecting to {host}:{port}…"));
+            refresh_library(&state);
+        }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thousands;
+
+    #[test]
+    fn small_numbers_are_left_alone() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(7), "7");
+        assert_eq!(thousands(999), "999");
+    }
+
+    #[test]
+    fn groups_of_three_are_separated() {
+        // A narrow no-break space, so the count never wraps mid-number.
+        assert_eq!(thousands(1_000), "1\u{202f}000");
+        assert_eq!(thousands(20_317), "20\u{202f}317");
+        assert_eq!(thousands(1_000_000), "1\u{202f}000\u{202f}000");
+    }
+
+    #[test]
+    fn every_boundary_gets_exactly_one_separator() {
+        for (n, expected) in [
+            (999u64, 0usize),
+            (1_000, 1),
+            (999_999, 1),
+            (1_000_000, 2),
+            (u64::MAX, 6),
+        ] {
+            let formatted = thousands(n);
+            assert_eq!(
+                formatted.matches('\u{202f}').count(),
+                expected,
+                "{n} formatted as {formatted}"
+            );
+            // Separators are inserted, never substituted.
+            assert_eq!(
+                formatted.chars().filter(char::is_ascii_digit).count(),
+                n.to_string().len()
+            );
+        }
+    }
 }

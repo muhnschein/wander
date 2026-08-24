@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.muhnschein.Wander</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Wander</name>
+  <summary>Read ZIM archives served by cairn</summary>
+
+  <description>
+    <p>
+      Wander is a reader for ZIM archives — offline snapshots of Wikipedia and
+      other sites — served by a cairn daemon. Point it at a cairn instance,
+      browse what it has open, and read the entries.
+    </p>
+    <p>
+      Archived pages are treated as untrusted markup. JavaScript is disabled,
+      each archive is kept on its own isolated origin with no persistent
+      website data, and the reader cannot reach the network: entries arrive
+      through a private URI scheme served inside the browser process, so an
+      archived page carrying an absolute link cannot quietly fetch it.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Browse every archive a cairn daemon has open</li>
+      <li>Title-prefix search across all archives at once</li>
+      <li>A table of contents for the entry you are reading</li>
+      <li>Find on page, with a match count</li>
+      <li>History and bookmarks</li>
+      <li>One random article, whenever you feel lucky</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.muhnschein.Wander.desktop</launchable>
+
+  <url type="homepage">https://github.com/muhnschein/wander</url>
+  <url type="bugtracker">https://github.com/muhnschein/wander/issues</url>
+  <url type="vcs-browser">https://github.com/muhnschein/wander</url>
+
+  <developer id="io.github.muhnschein">
+    <name>muhnschein</name>
+  </developer>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-24" type="development">
+      <description>
+        <p>Pre-alpha. Reading, search, contents, history and bookmarks.</p>
+      </description>
+    </release>
+  </releases>
+</component>

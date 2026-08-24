@@ -15,6 +15,37 @@ pub struct Status {
     pub auth: Option<String>,
     #[serde(default)]
     pub sandbox: SandboxStatus,
+    #[serde(default)]
+    pub limits: Limits,
+}
+
+/// The bounds a daemon advertises for itself. Defaults match the documented
+/// ones in `cairn-api(7)`, so a daemon too old to report them still yields
+/// usable numbers rather than zeroes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Limits {
+    #[serde(default = "default_suggest_max_query")]
+    pub suggest_max_query: usize,
+    #[serde(default = "default_suggest_max_results")]
+    pub suggest_max_results: u32,
+}
+
+fn default_suggest_max_query() -> usize {
+    128
+}
+
+fn default_suggest_max_results() -> u32 {
+    32
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            suggest_max_query: default_suggest_max_query(),
+            suggest_max_results: default_suggest_max_results(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
