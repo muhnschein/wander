@@ -13,7 +13,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The app crate links GTK4, libadwaita and WebKitGTK; cairn-client needs
       # none of it, but the workspace is built as a whole here.
