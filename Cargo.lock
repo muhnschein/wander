@@ -834,6 +834,7 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "percent-encoding",
+ "serde",
  "serde_json",
  "webkit6",
 ]

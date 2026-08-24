@@ -24,6 +24,10 @@ GTK4 + libadwaita, written in Rust. Pre-alpha.
   outline is read out of the stored HTML rather than asked of the page;
   MediaWiki's `[edit]` links are kept out of the headings.
 - Find on page (Ctrl+F), with a match count.
+- History and bookmarks, kept in `~/.local/share/wander/library.json`
+  (mode `0600` — what you have been reading is nobody else's business).
+  History holds the last 500 entries; revisiting one moves it up rather
+  than repeating it.
 - Title-prefix search in the open archive, wired to cairn's `/suggest`.
 - One random article, whenever you feel lucky.
 - External links are blocked by default and only opened after an explicit
@@ -40,7 +44,7 @@ GTK4 + libadwaita, written in Rust. Pre-alpha.
 
 ## What it does not do (yet)
 
-- A history list, bookmarks, tabs, print.
+- Tabs, print, reading position.
 - Full-text search: cairn 1.x offers none; Wander inherits that gap.
 - Anything but reading. There is no download manager, no catalogue, no OPDS.
 

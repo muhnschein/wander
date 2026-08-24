@@ -1,4 +1,5 @@
 use crate::scheme;
+use crate::store::{Store, Visit};
 use crate::toc::Heading;
 use adw::prelude::*;
 use cairn_client::{ArchiveSummary, CairnClient};
@@ -9,7 +10,12 @@ use webkit::prelude::*;
 
 const SUGGEST_LIMIT: u32 = 12;
 
-pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::NavigationPage {
+pub fn reader_page(
+    client: Arc<CairnClient>,
+    archive: ArchiveSummary,
+    store: Rc<RefCell<Store>>,
+    initial_path: Option<String>,
+) -> adw::NavigationPage {
     let uuid = archive.uuid.clone();
     let title = archive.title.clone();
     let main_page = archive.main_page.clone();
@@ -72,6 +78,12 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
     find_button.set_icon_name("edit-find-symbolic");
     find_button.set_tooltip_text(Some("Find on page (Ctrl+F)"));
     header.pack_end(&find_button);
+
+    let bookmark_button = gtk::ToggleButton::new();
+    bookmark_button.set_icon_name("non-starred-symbolic");
+    bookmark_button.set_tooltip_text(Some("Bookmark this entry"));
+    bookmark_button.set_sensitive(false);
+    header.pack_end(&bookmark_button);
 
     let spinner = gtk::Spinner::new();
     header.pack_end(&spinner);
@@ -152,6 +164,8 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
         toc_list: toc_list.clone(),
         anchors: RefCell::new(Vec::new()),
         current_path: RefCell::new(String::new()),
+        store,
+        archive_title: title.clone(),
     });
 
     // A popover parented to a widget is not owned by it: without this GTK warns
@@ -220,6 +234,34 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
         });
     });
 
+    // The <title> is parsed after the load finishes, so recording only on
+    // Finished files every entry under its path. Re-recording on the title
+    // notification corrects it in place, since a repeat visit updates rather
+    // than duplicates.
+    let title_ui = ui.clone();
+    let title_bookmark = bookmark_button.clone();
+    view.connect_title_notify(move |_| {
+        record_visit(&title_ui, &title_bookmark);
+    });
+
+    let bookmark_ui = ui.clone();
+    bookmark_button.connect_clicked(move |button| {
+        let Some(visit) = bookmark_ui.current_visit() else {
+            return;
+        };
+        let bookmarked = bookmark_ui.store.borrow_mut().toggle_bookmark(visit);
+        bookmark_ui.store.borrow().save();
+        set_bookmark_state(button, bookmarked);
+        toast(
+            &bookmark_ui.view,
+            if bookmarked {
+                "Bookmarked."
+            } else {
+                "Bookmark removed."
+            },
+        );
+    });
+
     let back_view = view.clone();
     back_button.connect_clicked(move |_| back_view.go_back());
     let forward_view = view.clone();
@@ -230,6 +272,7 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
     let spin = spinner.clone();
     let toc_ui = ui.clone();
     let toc_toggle = toc_button.clone();
+    let bookmark = bookmark_button.clone();
     view.connect_load_changed(move |view, event| {
         back.set_sensitive(view.can_go_back());
         forward.set_sensitive(view.can_go_forward());
@@ -238,6 +281,7 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
         spin.set_spinning(loading);
         if event == webkit::LoadEvent::Finished {
             refresh_outline(&toc_ui, &toc_toggle);
+            record_visit(&toc_ui, &bookmark);
         }
     });
 
@@ -293,10 +337,10 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
         false
     });
 
-    // Loading the main page under its own URI rather than the archive root
-    // gives WebKit the correct base for the relative links inside it.
-    match main_page.as_deref() {
-        Some(main) if !main.is_empty() => load_entry(&ui, main),
+    // Loading an entry under its own URI rather than the archive root gives
+    // WebKit the correct base for the relative links inside it.
+    match initial_path.as_deref().or(main_page.as_deref()) {
+        Some(entry) if !entry.is_empty() => load_entry(&ui, entry),
         _ => view.load_uri(&format!("{}://{}/", scheme::SCHEME, uuid)),
     }
 
@@ -323,6 +367,42 @@ struct ReaderUi {
     anchors: RefCell<Vec<Option<String>>>,
     /// Entry path currently displayed, so an outline jump knows what to reload.
     current_path: RefCell<String>,
+    store: Rc<RefCell<Store>>,
+    /// Denormalised into each visit, so a history row can still say where it
+    /// came from once the archive is closed on the daemon.
+    archive_title: String,
+}
+
+impl ReaderUi {
+    /// What is on screen now, as a record for history or bookmarks.
+    ///
+    /// The path comes from the view's own URI rather than `current_path`: that
+    /// is only refreshed once a load finishes, and a title can arrive while the
+    /// next entry is already loading, which would file it under the old path.
+    fn current_visit(&self) -> Option<Visit> {
+        let path = self
+            .view
+            .uri()
+            .and_then(|uri| scheme::parse_target(&uri))
+            .unwrap_or_default();
+        if path.is_empty() {
+            return None;
+        }
+        let title = self
+            .view
+            .title()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            // An entry with no <title> is better listed by its path than blank.
+            .unwrap_or_else(|| path.clone());
+        Some(Visit {
+            uuid: self.uuid.clone(),
+            path,
+            title,
+            archive_title: self.archive_title.clone(),
+            at: crate::store::now(),
+        })
+    }
 }
 
 /// Fail every real network load in this session closed.
@@ -516,6 +596,36 @@ fn install_find(
             label.set_text("");
         }
     });
+}
+
+/// Record the entry now on screen and sync the bookmark button to it.
+fn record_visit(ui: &Rc<ReaderUi>, button: &gtk::ToggleButton) {
+    let Some(visit) = ui.current_visit() else {
+        button.set_sensitive(false);
+        return;
+    };
+    let bookmarked = {
+        let mut store = ui.store.borrow_mut();
+        store.record(visit.clone());
+        store.is_bookmarked(&visit.uuid, &visit.path)
+    };
+    ui.store.borrow().save();
+    button.set_sensitive(true);
+    set_bookmark_state(button, bookmarked);
+}
+
+fn set_bookmark_state(button: &gtk::ToggleButton, bookmarked: bool) {
+    // `set_active` would re-enter the clicked handler; block it while syncing.
+    button.set_icon_name(if bookmarked {
+        "starred-symbolic"
+    } else {
+        "non-starred-symbolic"
+    });
+    button.set_tooltip_text(Some(if bookmarked {
+        "Remove bookmark"
+    } else {
+        "Bookmark this entry"
+    }));
 }
 
 /// Post a message on the window's toast overlay, if the widget is in one.

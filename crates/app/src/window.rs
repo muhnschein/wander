@@ -1,4 +1,5 @@
 use crate::settings::{self, ServerConfig};
+use crate::store::{Store, Visit};
 use adw::prelude::*;
 use cairn_client::{ArchiveSummary, CairnClient};
 use std::cell::{Cell, RefCell};
@@ -21,6 +22,10 @@ struct State {
     /// Guards against a second listing racing the first when refresh is
     /// clicked repeatedly; the later response would otherwise win arbitrarily.
     busy: Cell<bool>,
+    store: Rc<RefCell<Store>>,
+    /// The last listing, so a history or bookmark row can find the archive it
+    /// names. Reopening needs the summary, not just the uuid.
+    archives: RefCell<Vec<ArchiveSummary>>,
 }
 
 impl std::ops::Deref for Window {
@@ -54,6 +59,10 @@ impl Window {
         let prefs_button = gtk::Button::from_icon_name("emblem-system-symbolic");
         prefs_button.set_tooltip_text(Some("Server settings"));
         header.pack_end(&prefs_button);
+
+        let saved_button = gtk::Button::from_icon_name("user-bookmarks-symbolic");
+        saved_button.set_tooltip_text(Some("History and bookmarks"));
+        header.pack_end(&saved_button);
 
         let list = gtk::ListBox::new();
         list.set_css_classes(&["boxed-list"]);
@@ -109,6 +118,8 @@ impl Window {
                 spinner,
                 toasts,
                 busy: Cell::new(false),
+                store: Rc::new(RefCell::new(Store::load())),
+                archives: RefCell::new(Vec::new()),
             }),
         };
 
@@ -125,6 +136,14 @@ impl Window {
         prefs_button.connect_clicked(move |_| {
             if let Some(state) = prefs_state.upgrade() {
                 open_settings(&state);
+            }
+        });
+
+        let saved_state = Rc::downgrade(&window.state);
+        saved_button.connect_clicked(move |_| {
+            if let Some(state) = saved_state.upgrade() {
+                let page = saved_page(&state);
+                state.nav.push(&page);
             }
         });
 
@@ -218,6 +237,7 @@ fn refresh_library(state: &Rc<State>) {
                     );
                     return;
                 }
+                *state.archives.borrow_mut() = archives.clone();
                 let weak = Rc::downgrade(&state);
                 for archive in archives {
                     state.list.append(&archive_row(&weak, archive));
@@ -276,14 +296,165 @@ fn archive_row(state: &Weak<State>, archive: ArchiveSummary) -> gtk::Widget {
         let Some(state) = state.upgrade() else {
             return;
         };
-        let Some(client) = state.client.borrow().clone() else {
-            return;
-        };
-        let page = crate::reader::reader_page(client, archive.clone());
-        state.nav.push(&page);
+        open_entry(&state, &archive, None);
     });
 
     row.upcast()
+}
+
+/// Push a reader for `archive`, optionally opening a particular entry.
+fn open_entry(state: &Rc<State>, archive: &ArchiveSummary, path: Option<String>) {
+    let Some(client) = state.client.borrow().clone() else {
+        return;
+    };
+    let page = crate::reader::reader_page(client, archive.clone(), state.store.clone(), path);
+    state.nav.push(&page);
+}
+
+/// A saved row names its archive by uuid, which is only reopenable while that
+/// archive is still one the daemon has open.
+fn open_saved(state: &Rc<State>, visit: &Visit) {
+    let archive = state
+        .archives
+        .borrow()
+        .iter()
+        .find(|a| a.uuid == visit.uuid)
+        .cloned();
+    match archive {
+        Some(archive) => open_entry(state, &archive, Some(visit.path.clone())),
+        None => toast(
+            state,
+            &format!(
+                "{} is not open on this server any more.",
+                visit.archive_title
+            ),
+        ),
+    }
+}
+
+/// History and bookmarks, side by side.
+fn saved_page(state: &Rc<State>) -> adw::NavigationPage {
+    let stack = adw::ViewStack::new();
+
+    let history = saved_list(
+        state,
+        state.store.borrow().history(),
+        "No history yet",
+        "Entries you open are listed here.",
+    );
+    let bookmarks = saved_list(
+        state,
+        state.store.borrow().bookmarks(),
+        "No bookmarks yet",
+        "Star an entry while reading to keep it here.",
+    );
+    stack.add_titled_with_icon(
+        &history,
+        Some("history"),
+        "History",
+        "document-open-recent-symbolic",
+    );
+    stack.add_titled_with_icon(
+        &bookmarks,
+        Some("bookmarks"),
+        "Bookmarks",
+        "user-bookmarks-symbolic",
+    );
+
+    let header = adw::HeaderBar::new();
+    let switcher = adw::ViewSwitcher::builder()
+        .stack(&stack)
+        .policy(adw::ViewSwitcherPolicy::Wide)
+        .build();
+    header.set_title_widget(Some(&switcher));
+
+    let clear = gtk::Button::from_icon_name("user-trash-symbolic");
+    clear.set_tooltip_text(Some("Clear history"));
+    header.pack_end(&clear);
+
+    let clear_state = Rc::downgrade(state);
+    let clear_stack = stack.clone();
+    clear.connect_clicked(move |_| {
+        let Some(state) = clear_state.upgrade() else {
+            return;
+        };
+        state.store.borrow_mut().clear_history();
+        state.store.borrow().save();
+        // Rebuild in place so the emptied list is visible immediately.
+        let refreshed = saved_list(
+            &state,
+            &[],
+            "No history yet",
+            "Entries you open are listed here.",
+        );
+        if let Some(old) = clear_stack.child_by_name("history") {
+            clear_stack.remove(&old);
+        }
+        clear_stack.add_titled_with_icon(
+            &refreshed,
+            Some("history"),
+            "History",
+            "document-open-recent-symbolic",
+        );
+        clear_stack.set_visible_child_name("history");
+        toast(&state, "History cleared.");
+    });
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&stack));
+
+    adw::NavigationPage::builder()
+        .title("Saved")
+        .child(&toolbar)
+        .build()
+}
+
+fn saved_list(
+    state: &Rc<State>,
+    visits: &[Visit],
+    empty_title: &str,
+    empty_body: &str,
+) -> gtk::Widget {
+    if visits.is_empty() {
+        return adw::StatusPage::builder()
+            .icon_name("document-open-recent-symbolic")
+            .title(empty_title)
+            .description(empty_body)
+            .build()
+            .upcast();
+    }
+
+    let list = gtk::ListBox::new();
+    list.set_css_classes(&["boxed-list"]);
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.set_margin_top(12);
+    list.set_margin_bottom(12);
+    list.set_margin_start(12);
+    list.set_margin_end(12);
+
+    for visit in visits {
+        // Markup off before any archive-supplied text, as everywhere else.
+        let row = adw::ActionRow::builder().activatable(true).build();
+        row.set_use_markup(false);
+        row.set_title(&visit.title);
+        row.set_subtitle(&format!("{} · {}", visit.archive_title, visit.path));
+
+        let weak = Rc::downgrade(state);
+        let visit = visit.clone();
+        row.connect_activated(move |_| {
+            if let Some(state) = weak.upgrade() {
+                open_saved(&state, &visit);
+            }
+        });
+        list.append(&row);
+    }
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_child(Some(&list));
+    scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scrolled.set_vexpand(true);
+    scrolled.upcast()
 }
 
 fn thousands(n: u64) -> String {

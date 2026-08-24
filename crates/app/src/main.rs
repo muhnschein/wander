@@ -1,6 +1,7 @@
 mod reader;
 mod scheme;
 mod settings;
+mod store;
 mod toc;
 mod window;
 
