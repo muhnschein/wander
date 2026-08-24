@@ -10,4 +10,4 @@ mod model;
 
 pub use client::{CairnClient, Entry, EntryMeta};
 pub use error::{Error, code};
-pub use model::{ArchiveDetail, ArchiveSummary, SandboxLayer, Status, Suggestion};
+pub use model::{ArchiveDetail, ArchiveSummary, Limits, SandboxLayer, Status, Suggestion};

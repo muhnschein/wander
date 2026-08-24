@@ -48,7 +48,13 @@ GTK4 + libadwaita, written in Rust. Pre-alpha.
 ## What it does not do (yet)
 
 - Tabs, print, reading position.
-- Full-text search: cairn 1.x offers none; Wander inherits that gap.
+- Full-text search. `cairn-api(7)` states it plainly: there is none in
+  cairn 1.x. Suggestions come from a binary search over the archive's
+  title pointer list, so they are title-prefix only, cover front articles
+  only, and match byte-exactly — no case folding, no diacritic folding.
+  Closing this gap is upstream work: the ZIM format can carry a full-text
+  index, but nothing client-side can substitute for a daemon endpoint
+  over it.
 - Anything but reading. There is no download manager, no catalogue, no OPDS.
 
 ## Building

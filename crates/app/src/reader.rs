@@ -660,7 +660,10 @@ fn show_notice(ui: &ReaderUi, message: &str) {
 fn show_suggestions(ui: &ReaderUi, suggestions: Vec<cairn_client::Suggestion>) {
     clear_results(ui);
     if suggestions.is_empty() {
-        show_notice(ui, "No matching articles.");
+        show_notice(
+            ui,
+            "No matching articles. Titles match exactly, capitals included.",
+        );
         return;
     }
     let mut paths = ui.paths.borrow_mut();

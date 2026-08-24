@@ -655,3 +655,63 @@ fn optional_archive_fields_may_all_be_absent() {
     assert_eq!(bare.cluster_count, None);
     assert!(!bare.suggest);
 }
+
+#[test]
+fn an_over_long_query_is_trimmed_rather_than_rejected() {
+    // cairn bounds `q` by suggest_max_query (128) and answers bad_query past
+    // it. Trimming keeps a prefix search working instead of round-tripping to
+    // a guaranteed error.
+    let server = serve(|req| {
+        let q = req
+            .target
+            .split("q=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .expect("query");
+        // Percent-encoded, so every byte of a plain ASCII query is one char.
+        assert_eq!(
+            q.len(),
+            128,
+            "query was not trimmed to the documented bound"
+        );
+        Response::json(200, r#"{"suggestions":[]}"#)
+    });
+    let long = "a".repeat(500);
+    client(&server.addr)
+        .suggest(UUID, &long, 5)
+        .expect("suggest");
+}
+
+#[test]
+fn trimming_a_query_never_splits_a_character() {
+    // 43 three-byte characters is 129 bytes: the cut lands mid-character
+    // unless the boundary is respected.
+    let server = serve(|_| Response::json(200, r#"{"suggestions":[]}"#));
+    let long = "日".repeat(43);
+    assert_eq!(long.len(), 129);
+    // Panicking on a non-boundary slice would fail the call, not just the assert.
+    client(&server.addr)
+        .suggest(UUID, &long, 5)
+        .expect("suggest");
+}
+
+#[test]
+fn status_carries_the_daemons_advertised_limits() {
+    let server = serve(|_| {
+        Response::json(
+            200,
+            r#"{"version":"2026.08","limits":{"suggest_max_query":64,"suggest_max_results":8}}"#,
+        )
+    });
+    let status = client(&server.addr).status().expect("status");
+    assert_eq!(status.limits.suggest_max_query, 64);
+    assert_eq!(status.limits.suggest_max_results, 8);
+}
+
+#[test]
+fn a_daemon_that_reports_no_limits_still_yields_the_documented_ones() {
+    let server = serve(|_| Response::json(200, r#"{"version":"2026.08"}"#));
+    let status = client(&server.addr).status().expect("status");
+    assert_eq!(status.limits.suggest_max_query, 128);
+    assert_eq!(status.limits.suggest_max_results, 32);
+}

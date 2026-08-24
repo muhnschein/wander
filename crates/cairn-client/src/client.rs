@@ -16,6 +16,11 @@ const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'~');
 
+/// `suggest_max_query` from `cairn-api(7)`. A query past it is answered with
+/// `bad_query`, so it is trimmed here instead: suggestions match on a title
+/// prefix, and a shorter prefix is less specific rather than wrong.
+const MAX_SUGGEST_QUERY_BYTES: usize = 128;
+
 const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 // Every request occupies a thread from the GTK blocking pool for its whole
@@ -158,7 +163,7 @@ impl CairnClient {
         let url = format!(
             "{}/v1/archives/{uuid}/suggest?q={}&limit={}",
             self.base_url,
-            utf8_percent_encode(query, PATH_SET),
+            utf8_percent_encode(trim_query(query), PATH_SET),
             limit.clamp(1, 32)
         );
         let resp: SuggestionsResponse = self.get_json(&url)?;
@@ -274,6 +279,18 @@ fn header_str(resp: &ureq::http::Response<ureq::Body>, name: &str) -> Option<Str
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
+}
+
+/// Cut `query` to the largest character boundary within the daemon's limit.
+fn trim_query(query: &str) -> &str {
+    if query.len() <= MAX_SUGGEST_QUERY_BYTES {
+        return query;
+    }
+    let mut end = MAX_SUGGEST_QUERY_BYTES;
+    while end > 0 && !query.is_char_boundary(end) {
+        end -= 1;
+    }
+    &query[..end]
 }
 
 fn canonical_uuid(uuid: &str) -> Result<&str, Error> {

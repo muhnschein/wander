@@ -449,7 +449,10 @@ fn show_hits(state: &Rc<State>, hits: Vec<Visit>) {
             state,
             "system-search-symbolic",
             "No matching entries",
-            "cairn matches on title prefixes, so try the start of a title.",
+            // cairn-api(7): matching is byte-exact on the stored title, with no
+            // case or diacritic folding, which is surprising enough to say out
+            // loud rather than leave someone retyping a lowercase query.
+            "cairn matches the start of a title exactly, including capitals and accents.",
         );
         return;
     }
