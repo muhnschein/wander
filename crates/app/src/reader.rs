@@ -2,18 +2,28 @@ use crate::scheme;
 use adw::prelude::*;
 use cairn_client::{ArchiveSummary, CairnClient};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use webkit::prelude::*;
 
 const SUGGEST_LIMIT: u32 = 12;
 
-const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
+/// Percent-encoding for the path portion of a `cairn://` URI.
+///
+/// Unlike the encoding the HTTP client applies, `/` is left alone. cairn takes
+/// an entry path as a single opaque segment, but a `cairn://` URI is a real URI
+/// that WebKit resolves relative links against: keeping the separators means a
+/// link to `Graben.html` inside `A/Vienna/Ring.html` resolves to
+/// `A/Vienna/Graben.html`, as the archive author intended. Encoding it to `%2F`
+/// would flatten every entry into the archive root and send each relative link
+/// to a path that does not exist.
+const URI_PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
-    .remove(b'~');
+    .remove(b'~')
+    .remove(b'/');
 
 pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::NavigationPage {
     let uuid = archive.uuid.clone();
@@ -22,7 +32,8 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
 
     let context = webkit::WebContext::new();
     let session = webkit::NetworkSession::new_ephemeral();
-    scheme::install(&context, client.clone(), uuid.clone(), main_page);
+    block_outbound_network(&session);
+    scheme::install(&context, client.clone(), uuid.clone(), main_page.clone());
 
     let view = webkit::WebView::builder()
         .web_context(&context)
@@ -38,6 +49,19 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
 
     let header = adw::HeaderBar::new();
 
+    let back_button = gtk::Button::from_icon_name("go-previous-symbolic");
+    back_button.set_tooltip_text(Some("Back"));
+    back_button.set_sensitive(false);
+    let forward_button = gtk::Button::from_icon_name("go-next-symbolic");
+    forward_button.set_tooltip_text(Some("Forward"));
+    forward_button.set_sensitive(false);
+
+    let history = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    history.add_css_class("linked");
+    history.append(&back_button);
+    history.append(&forward_button);
+    header.pack_start(&history);
+
     let search_entry = gtk::SearchEntry::new();
     search_entry.set_width_request(320);
     search_entry.set_placeholder_text(Some("Find article…"));
@@ -46,6 +70,9 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
     let random_button = gtk::Button::from_icon_name("media-playlist-shuffle-symbolic");
     random_button.set_tooltip_text(Some("Random article"));
     header.pack_end(&random_button);
+
+    let spinner = gtk::Spinner::new();
+    header.pack_end(&spinner);
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
@@ -63,14 +90,19 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
         uuid: uuid.clone(),
         view: view.clone(),
         popover: popover.clone(),
+        results: results.clone(),
+        paths: RefCell::new(Vec::new()),
         generation: Cell::new(0),
     });
 
+    // A popover parented to a widget is not owned by it: without this GTK warns
+    // about a finalised widget that still has children when the page is popped.
+    let orphan = popover.clone();
+    search_entry.connect_destroy(move |_| orphan.unparent());
+
     let search_ui = ui.clone();
-    let results_for_search = results.clone();
     search_entry.connect_search_changed(move |entry| {
         let ui = search_ui.clone();
-        let results = results_for_search.clone();
         let query = entry.text().to_string();
         let request_gen = ui.generation.get() + 1;
         ui.generation.set(request_gen);
@@ -83,39 +115,81 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
             let uuid = ui.uuid.clone();
             let fetched =
                 gio::spawn_blocking(move || client.suggest(&uuid, &query, SUGGEST_LIMIT)).await;
+            // A slower earlier request must not overwrite the newest results.
             if ui.generation.get() != request_gen {
                 return;
             }
             match fetched {
-                Ok(Ok(suggestions)) => show_suggestions(&ui, &results, suggestions),
-                _ => ui.popover.popdown(),
+                Ok(Ok(suggestions)) => show_suggestions(&ui, suggestions),
+                // Reporting a live-search failure as a toast would fire on every
+                // keystroke while the daemon is down, so it goes in the popover
+                // where the next keystroke replaces it.
+                Ok(Err(err)) => show_notice(&ui, &format!("Search failed: {err}")),
+                Err(_) => show_notice(&ui, "Search failed: background task failed."),
             }
         });
     });
 
     let activate_ui = ui.clone();
     results.connect_row_activated(move |_, row| {
-        let name = row.widget_name().to_string();
-        if let Some(path) = name.strip_prefix("path:") {
-            load_entry(&activate_ui, path);
+        let index = row.index();
+        if index < 0 {
+            return;
+        }
+        let path = activate_ui.paths.borrow().get(index as usize).cloned();
+        if let Some(path) = path {
+            load_entry(&activate_ui, &path);
             activate_ui.popover.popdown();
         }
     });
 
     let random_ui = ui.clone();
-    random_button.connect_clicked(move |_| {
+    random_button.connect_clicked(move |button| {
         let ui = random_ui.clone();
+        let button = button.clone();
+        button.set_sensitive(false);
         glib::spawn_future_local(async move {
             let client = ui.client.clone();
             let uuid = ui.uuid.clone();
             let fetched = gio::spawn_blocking(move || client.random(&uuid)).await;
-            if let Ok(Ok(path)) = fetched {
-                load_entry(&ui, &path);
+            button.set_sensitive(true);
+            match fetched {
+                Ok(Ok(path)) => load_entry(&ui, &path),
+                Ok(Err(err)) => toast(&ui.view, &format!("No random article: {err}")),
+                Err(_) => toast(&ui.view, "No random article: background task failed."),
             }
         });
     });
 
-    view.load_uri(&format!("{}://{}/", scheme::SCHEME, uuid));
+    let back_view = view.clone();
+    back_button.connect_clicked(move |_| back_view.go_back());
+    let forward_view = view.clone();
+    forward_button.connect_clicked(move |_| forward_view.go_forward());
+
+    let back = back_button.clone();
+    let forward = forward_button.clone();
+    let spin = spinner.clone();
+    view.connect_load_changed(move |view, _| {
+        back.set_sensitive(view.can_go_back());
+        forward.set_sensitive(view.can_go_forward());
+        let loading = view.is_loading();
+        spin.set_visible(loading);
+        spin.set_spinning(loading);
+    });
+
+    view.connect_load_failed(|view, _, uri, error| {
+        // The scheme handler already turned a cairn error into this message;
+        // surface it instead of leaving the reader on a blank page.
+        toast(view, &format!("Could not open {uri}: {}", error.message()));
+        false
+    });
+
+    // Loading the main page under its own URI rather than the archive root
+    // gives WebKit the correct base for the relative links inside it.
+    match main_page.as_deref() {
+        Some(main) if !main.is_empty() => load_entry(&ui, main),
+        _ => view.load_uri(&format!("{}://{}/", scheme::SCHEME, uuid)),
+    }
 
     adw::NavigationPage::builder()
         .title(title)
@@ -128,7 +202,27 @@ struct ReaderUi {
     uuid: String,
     view: webkit::WebView,
     popover: gtk::Popover,
+    results: gtk::ListBox,
+    /// Entry path for each row currently in `results`, parallel by index. Rows
+    /// carry no payload of their own, so this is what an activated row maps to.
+    paths: RefCell<Vec<String>>,
     generation: Cell<u64>,
+}
+
+/// Fail every real network load in this session closed.
+///
+/// The navigation policy handler only sees navigations. An archived page that
+/// carries an absolute `https://` image, stylesheet or font would have those
+/// subresources fetched for real, announcing the reader's address to whoever
+/// the archive author linked to — precisely what an offline archive reader
+/// should not do. Pointing every proxied scheme at a closed local port is the
+/// bluntest reliable way to stop that.
+///
+/// `cairn://` is untouched: a registered URI scheme is served by its handler
+/// inside the web process and never reaches the networking stack.
+fn block_outbound_network(session: &webkit::NetworkSession) {
+    let blackhole = webkit::NetworkProxySettings::new(Some("http://127.0.0.1:9"), &[]);
+    session.set_proxy_settings(webkit::NetworkProxyMode::Custom, Some(&blackhole));
 }
 
 fn install_policy_guard(view: &webkit::WebView) {
@@ -155,6 +249,10 @@ fn install_policy_guard(view: &webkit::WebView) {
         {
             ask_open_external(&parent, &uri);
         }
+        // Claiming the decision without resolving it would leave the navigation
+        // pending forever; the default handler that would have called `use_` no
+        // longer runs once this returns true.
+        decision.ignore();
         true
     });
 }
@@ -181,31 +279,58 @@ fn ask_open_external(parent: &gtk::Window, uri: &str) {
 }
 
 fn load_entry(ui: &ReaderUi, path: &str) {
-    let encoded = utf8_percent_encode(path, PATH_SET).to_string();
+    let encoded = utf8_percent_encode(path, URI_PATH_SET).to_string();
     let uri = format!("{}://{}/{}", scheme::SCHEME, ui.uuid, encoded);
     ui.view.load_uri(&uri);
 }
 
-fn show_suggestions(
-    ui: &ReaderUi,
-    results: &gtk::ListBox,
-    suggestions: Vec<cairn_client::Suggestion>,
-) {
-    while let Some(child) = results.first_child() {
-        results.remove(&child);
+/// Post a message on the window's toast overlay, if the widget is in one.
+fn toast(widget: &impl IsA<gtk::Widget>, message: &str) {
+    if let Some(overlay) = widget
+        .as_ref()
+        .ancestor(adw::ToastOverlay::static_type())
+        .and_then(|w| w.downcast::<adw::ToastOverlay>().ok())
+    {
+        overlay.add_toast(adw::Toast::builder().title(message).timeout(4).build());
     }
+}
+
+fn clear_results(ui: &ReaderUi) {
+    while let Some(child) = ui.results.first_child() {
+        ui.results.remove(&child);
+    }
+    ui.paths.borrow_mut().clear();
+}
+
+/// Show a single non-activatable row in the suggestion popover.
+fn show_notice(ui: &ReaderUi, message: &str) {
+    clear_results(ui);
+    let row = adw::ActionRow::builder().title(message).build();
+    row.set_use_markup(false);
+    row.add_css_class("dim-label");
+    ui.results.append(&row);
+    ui.popover.popup();
+}
+
+fn show_suggestions(ui: &ReaderUi, suggestions: Vec<cairn_client::Suggestion>) {
+    clear_results(ui);
     if suggestions.is_empty() {
-        ui.popover.popdown();
+        show_notice(ui, "No matching articles.");
         return;
     }
+    let mut paths = ui.paths.borrow_mut();
     for suggestion in suggestions {
         let row = adw::ActionRow::builder()
             .title(&suggestion.title)
             .subtitle(&suggestion.path)
             .activatable(true)
             .build();
-        row.set_widget_name(&format!("path:{}", suggestion.path));
-        results.append(&row);
+        // Suggestion titles and paths come from the archive; an ActionRow would
+        // otherwise render them as Pango markup and drop any containing `&`.
+        row.set_use_markup(false);
+        ui.results.append(&row);
+        paths.push(suggestion.path);
     }
+    drop(paths);
     ui.popover.popup();
 }

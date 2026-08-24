@@ -17,6 +17,30 @@ pub mod code {
     pub const INTERNAL: &str = "internal";
     pub const ARCHIVE_UNAVAILABLE: &str = "archive_unavailable";
     pub const VERSION_NOT_SUPPORTED: &str = "version_not_supported";
+
+    /// The code a well-behaved cairn would have sent for `status`, for use when
+    /// the response body is missing or is not a cairn error envelope — a
+    /// reverse proxy answering instead of cairn, say.
+    ///
+    /// Only statuses whose cairn code is a plain synonym of the HTTP status are
+    /// mapped. 5xx deliberately falls through to [`INTERNAL`]: a 500 or 503
+    /// from an intermediary says nothing about which cairn-specific failure
+    /// occurred, and guessing [`ARCHIVE_UNAVAILABLE`] there would invent detail
+    /// the response never carried.
+    pub fn for_status(status: u16) -> &'static str {
+        match status {
+            400 => BAD_REQUEST,
+            401 => UNAUTHORIZED,
+            404 => NOT_FOUND,
+            405 => METHOD_NOT_ALLOWED,
+            408 => REQUEST_TIMEOUT,
+            414 => URI_TOO_LONG,
+            416 => RANGE_NOT_SATISFIABLE,
+            429 => TOO_MANY_REQUESTS,
+            431 => HEADERS_TOO_LARGE,
+            _ => INTERNAL,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +61,14 @@ impl Error {
 
     pub fn is_unauthorized(&self) -> bool {
         matches!(self, Error::Api { code, .. } if code == code::UNAUTHORIZED)
+    }
+
+    /// The HTTP status cairn answered with, if this came from a response at all.
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Error::Api { status, .. } => Some(*status),
+            _ => None,
+        }
     }
 }
 

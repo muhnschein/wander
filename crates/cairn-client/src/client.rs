@@ -5,6 +5,7 @@ use crate::model::{
 };
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::de::DeserializeOwned;
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::time::Duration;
 use ureq::Agent;
@@ -17,8 +18,13 @@ const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
 
 const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
-const DEFAULT_GLOBAL_TIMEOUT: Duration = Duration::from_secs(600);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+// Every request occupies a thread from the GTK blocking pool for its whole
+// life, so a generous global timeout is not free: a stalled daemon would pin
+// those threads and freeze the reader. Two minutes is long enough for a large
+// entry over a slow link and short enough that a dead server surfaces as an
+// error rather than a hang.
+const DEFAULT_GLOBAL_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct CairnClient {
@@ -45,14 +51,11 @@ pub struct EntryMeta {
 
 impl CairnClient {
     pub fn new(host: &str, port: u16, token: Option<&str>) -> Result<Self, Error> {
-        let host = host.trim();
-        if host.is_empty() {
-            return Err(Error::Invalid("host must not be empty".into()));
-        }
-        if host.contains('/') || host.contains('\\') {
-            return Err(Error::Invalid("host must be an IP address or name".into()));
-        }
-        Ok(Self::with_base_url(&format!("http://{host}:{port}"), token))
+        let authority = host_authority(host.trim())?;
+        Ok(Self::with_base_url(
+            &format!("http://{authority}:{port}"),
+            token,
+        ))
     }
 
     pub fn with_base_url(base_url: &str, token: Option<&str>) -> Self {
@@ -202,18 +205,55 @@ impl CairnClient {
 }
 
 fn api_error_from_body(status: u16, text: &str) -> Error {
+    // A body that parses but carries no code is as useless as one that does not
+    // parse at all, so both fall back to the status. Without this an nginx 404
+    // in front of cairn would surface as `internal` and `is_not_found` would
+    // answer false for a plain missing entry.
     match serde_json::from_str::<ErrorEnvelope>(text) {
-        Ok(env) => Error::Api {
+        Ok(env) if !env.error.code.is_empty() => Error::Api {
             status,
             code: env.error.code,
             message: env.error.message,
         },
-        Err(_) => Error::Api {
+        _ => Error::Api {
             status,
-            code: code::INTERNAL.to_string(),
+            code: code::for_status(status).to_string(),
             message: "malformed error response".to_string(),
         },
     }
+}
+
+/// Render `host` as the authority component of a URL, bracketing IPv6 literals.
+///
+/// Rejects anything that would let the host smuggle further URL syntax into the
+/// base address: userinfo (`@`) silently moves the real host to the far side of
+/// the separator, and a path, query or fragment would reroute every request the
+/// client builds on top of it.
+fn host_authority(host: &str) -> Result<String, Error> {
+    let host = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(inner) => inner,
+        None => host,
+    };
+    if host.is_empty() {
+        return Err(Error::Invalid("host must not be empty".into()));
+    }
+    if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(Error::Invalid("host must not contain whitespace".into()));
+    }
+    if host.contains(['/', '\\', '@', '?', '#', '[', ']']) {
+        return Err(Error::Invalid("host must be an IP address or name".into()));
+    }
+    // A colon is only legitimate in a bare IPv6 literal; anything else with one
+    // is a host:port pair that belongs in the separate `port` argument.
+    if host.contains(':') {
+        return match host.parse::<Ipv6Addr>() {
+            Ok(addr) => Ok(format!("[{addr}]")),
+            Err(_) => Err(Error::Invalid(
+                "host must not include a port; pass the port separately".into(),
+            )),
+        };
+    }
+    Ok(host.to_string())
 }
 
 #[derive(serde::Deserialize)]

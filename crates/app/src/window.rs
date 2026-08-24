@@ -1,8 +1,8 @@
 use crate::settings::{self, ServerConfig};
 use adw::prelude::*;
 use cairn_client::{ArchiveSummary, CairnClient};
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 pub struct Window {
@@ -15,7 +15,12 @@ struct State {
     nav: adw::NavigationView,
     list: gtk::ListBox,
     stack: gtk::Stack,
+    status: adw::StatusPage,
+    spinner: gtk::Spinner,
     toasts: adw::ToastOverlay,
+    /// Guards against a second listing racing the first when refresh is
+    /// clicked repeatedly; the later response would otherwise win arbitrarily.
+    busy: Cell<bool>,
 }
 
 impl std::ops::Deref for Window {
@@ -42,6 +47,10 @@ impl Window {
         refresh_button.set_tooltip_text(Some("Refresh library"));
         header.pack_start(&refresh_button);
 
+        let spinner = gtk::Spinner::new();
+        spinner.set_visible(false);
+        header.pack_start(&spinner);
+
         let prefs_button = gtk::Button::from_icon_name("emblem-system-symbolic");
         prefs_button.set_tooltip_text(Some("Server settings"));
         header.pack_end(&prefs_button);
@@ -58,7 +67,7 @@ impl Window {
         scrolled.set_child(Some(&list));
         scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
 
-        let status_page = adw::StatusPage::builder()
+        let status = adw::StatusPage::builder()
             .icon_name("system-search-symbolic")
             .title("Nothing to show yet")
             .description("Point Wander at a cairn instance to browse its archives.")
@@ -66,7 +75,7 @@ impl Window {
 
         let stack = gtk::Stack::new();
         stack.add_named(&scrolled, Some("library"));
-        stack.add_named(&status_page, Some("status"));
+        stack.add_named(&status, Some("status"));
         stack.set_visible_child_name("status");
 
         let nav = adw::NavigationView::new();
@@ -92,22 +101,35 @@ impl Window {
                 nav,
                 list,
                 stack,
+                status,
+                spinner,
                 toasts,
+                busy: Cell::new(false),
             }),
         };
 
-        let refresh_state = window.state.clone();
+        // These closures live on widgets that the state itself owns, so they
+        // hold a weak reference; a strong one would make the window immortal.
+        let refresh_state = Rc::downgrade(&window.state);
         refresh_button.connect_clicked(move |_| {
-            refresh_library(&refresh_state);
+            if let Some(state) = refresh_state.upgrade() {
+                refresh_library(&state);
+            }
         });
 
-        let prefs_state = window.state.clone();
+        let prefs_state = Rc::downgrade(&window.state);
         prefs_button.connect_clicked(move |_| {
-            open_settings(&prefs_state);
+            if let Some(state) = prefs_state.upgrade() {
+                open_settings(&state);
+            }
         });
 
         if let Some(config) = settings::load() {
-            apply_config(&window.state, &config);
+            // Without this the library stays empty on every launch until the
+            // user thinks to press refresh, even with a working saved server.
+            if apply_config(&window.state, &config) {
+                refresh_library(&window.state);
+            }
         }
 
         window
@@ -116,14 +138,28 @@ impl Window {
     pub fn open_settings(&self) {
         open_settings(&self.state);
     }
+
+    /// Whether the saved settings produced a usable client. False when nothing
+    /// is stored yet and also when what is stored no longer parses.
+    pub fn is_configured(&self) -> bool {
+        self.state.client.borrow().is_some()
+    }
 }
 
-fn apply_config(state: &State, config: &ServerConfig) {
+/// Point the window at `config`. Returns whether a usable client came of it.
+fn apply_config(state: &State, config: &ServerConfig) -> bool {
     match CairnClient::new(&config.host, config.port, config.token.as_deref()) {
         Ok(client) => {
             *state.client.borrow_mut() = Some(Arc::new(client));
+            true
         }
-        Err(err) => toast(state, &err.to_string()),
+        Err(err) => {
+            // Dropping the old client matters: keeping it would leave the
+            // window browsing the previous server while showing the new one.
+            *state.client.borrow_mut() = None;
+            toast(state, &err.to_string());
+            false
+        }
     }
 }
 
@@ -133,67 +169,101 @@ fn toast(state: &State, message: &str) {
         .add_toast(adw::Toast::builder().title(message).timeout(4).build());
 }
 
+fn show_status(state: &State, icon: &str, title: &str, description: &str) {
+    state.status.set_icon_name(Some(icon));
+    state.status.set_title(title);
+    state.status.set_description(Some(description));
+    state.stack.set_visible_child_name("status");
+}
+
 fn refresh_library(state: &Rc<State>) {
-    while let Some(child) = state.list.first_child() {
-        state.list.remove(&child);
-    }
     let Some(client) = state.client.borrow().clone() else {
-        state.stack.set_visible_child_name("status");
+        show_status(
+            state,
+            "system-search-symbolic",
+            "No server configured",
+            "Open the settings and point Wander at a cairn instance.",
+        );
         return;
     };
-    state.stack.set_visible_child_name("library");
+    if state.busy.replace(true) {
+        return;
+    }
+    state.spinner.set_visible(true);
+    state.spinner.set_spinning(true);
 
-    let weak_list = state.list.downgrade();
-    let weak_stack = state.stack.downgrade();
-    let state_for_error = Rc::downgrade(state);
-
+    let weak = Rc::downgrade(state);
     glib::spawn_future_local(async move {
         let fetched = gio::spawn_blocking(move || client.archives()).await;
-        let (Some(list), Some(stack)) = (weak_list.upgrade(), weak_stack.upgrade()) else {
+        let Some(state) = weak.upgrade() else {
             return;
         };
+        state.busy.set(false);
+        state.spinner.set_spinning(false);
+        state.spinner.set_visible(false);
+
         match fetched {
             Ok(Ok(archives)) => {
+                clear_list(&state);
+                if archives.is_empty() {
+                    show_status(
+                        &state,
+                        "folder-symbolic",
+                        "No open archives",
+                        "The server is reachable but has no archives open.",
+                    );
+                    return;
+                }
+                let weak = Rc::downgrade(&state);
                 for archive in archives {
-                    list.append(&archive_row(&state_for_error, archive));
+                    state.list.append(&archive_row(&weak, archive));
                 }
-                if list.first_child().is_none() {
-                    stack.set_visible_child_name("status");
-                    if let Some(state) = state_for_error.upgrade() {
-                        toast(&state, "The server is reachable but has no open archives.");
-                    }
-                }
+                state.stack.set_visible_child_name("library");
             }
-            Ok(Err(err)) => {
-                stack.set_visible_child_name("status");
-                if let Some(state) = state_for_error.upgrade() {
-                    toast(&state, &err.to_string());
-                }
-            }
-            Err(_) => {
-                stack.set_visible_child_name("status");
-                if let Some(state) = state_for_error.upgrade() {
-                    toast(&state, "Background task failed.");
-                }
-            }
+            Ok(Err(err)) => report_refresh_failure(&state, &err.to_string()),
+            Err(_) => report_refresh_failure(&state, "Background task failed."),
         }
     });
 }
 
-fn archive_row(state: &std::rc::Weak<State>, archive: ArchiveSummary) -> gtk::Widget {
+/// A failed refresh keeps whatever the library already showed — a stale listing
+/// beats an empty window — and only takes over the view when there is nothing
+/// left to preserve.
+fn report_refresh_failure(state: &Rc<State>, message: &str) {
+    if state.list.first_child().is_some() {
+        toast(state, message);
+    } else {
+        show_status(
+            state,
+            "network-error-symbolic",
+            "Cannot reach cairn",
+            message,
+        );
+    }
+}
+
+fn clear_list(state: &State) {
+    while let Some(child) = state.list.first_child() {
+        state.list.remove(&child);
+    }
+}
+
+fn archive_row(state: &Weak<State>, archive: ArchiveSummary) -> gtk::Widget {
+    let mut subtitle = format!("{} entries", thousands(archive.entry_count));
+    if archive.suggest {
+        subtitle.push_str(" · searchable");
+    }
+
     let row = adw::ActionRow::builder()
         .title(&archive.title)
-        .subtitle(format!(
-            "{} · {} entries",
-            archive.uuid, archive.entry_count
-        ))
+        .subtitle(subtitle)
         .activatable(true)
         .build();
-
-    let suffix = gtk::Label::new(None);
-    suffix.set_text(if archive.suggest { "searchable" } else { "" });
-    suffix.add_css_class("dim-label");
-    row.add_suffix(&suffix);
+    // Titles come out of the ZIM file, and an ActionRow renders them as Pango
+    // markup by default: an archive called "Arts & Crafts" would otherwise fail
+    // to parse and render as an empty row.
+    row.set_use_markup(false);
+    row.set_tooltip_text(Some(&archive.uuid));
 
     let state = state.clone();
     row.connect_activated(move |_| {
@@ -210,8 +280,22 @@ fn archive_row(state: &std::rc::Weak<State>, archive: ArchiveSummary) -> gtk::Wi
     row.upcast()
 }
 
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push('\u{202f}');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn open_settings(state: &Rc<State>) {
     let existing = settings::load().unwrap_or_default();
+    let previous_host = existing.host.clone();
+    let previous_port = existing.port;
 
     let dialog = adw::PreferencesDialog::new();
     dialog.set_title("Cairn server");
@@ -240,19 +324,34 @@ fn open_settings(state: &Rc<State>) {
     page.add(&group);
     dialog.add(&page);
 
-    let host_row = host_row.clone();
-    let port_row = port_row.clone();
-    let token_row = token_row.clone();
-    let state = state.clone();
+    let state = Rc::downgrade(state);
     dialog.connect_closed(move |_| {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+
+        // A rejected field falls back to the previous value rather than
+        // abandoning the whole edit: returning early here used to discard a
+        // corrected host because the port next to it had a typo.
         let host = host_row.text().trim().to_string();
+        let host = if host.is_empty() {
+            toast(&state, "Host must not be empty; keeping the previous one.");
+            previous_host.clone()
+        } else {
+            host
+        };
+
         let port = match port_row.text().trim().parse::<u16>() {
-            Ok(port) => port,
-            Err(_) => {
-                toast(&state, "Port must be a number between 0 and 65535.");
-                return;
+            Ok(port) if port > 0 => port,
+            _ => {
+                toast(
+                    &state,
+                    &format!("Port must be between 1 and 65535; keeping {previous_port}."),
+                );
+                previous_port
             }
         };
+
         let token = token_row.text().trim().to_string();
         let token = (!token.is_empty()).then_some(token);
 
@@ -262,8 +361,9 @@ fn open_settings(state: &Rc<State>) {
             token,
         };
         settings::save(&config);
-        apply_config(&state, &config);
-        toast(&state, &format!("Saved. Connecting to {host}:{port}…"));
-        refresh_library(&state);
+        if apply_config(&state, &config) {
+            toast(&state, &format!("Connecting to {host}:{port}…"));
+            refresh_library(&state);
+        }
     });
 }

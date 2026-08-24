@@ -427,3 +427,53 @@ fn malformed_error_body_still_yields_api_error() {
         other => panic!("expected Api error, got {other:?}"),
     }
 }
+
+#[test]
+fn ipv6_hosts_are_bracketed_in_the_base_url() {
+    let client = CairnClient::new("::1", 8080, None).expect("ipv6 host");
+    assert_eq!(client.base_url(), "http://[::1]:8080");
+
+    let already = CairnClient::new("[2001:db8::7]", 8080, None).expect("bracketed ipv6");
+    assert_eq!(already.base_url(), "http://[2001:db8::7]:8080");
+}
+
+#[test]
+fn ordinary_hosts_pass_through_untouched() {
+    let client = CairnClient::new("  cairn.example.org  ", 9000, None).expect("host");
+    assert_eq!(client.base_url(), "http://cairn.example.org:9000");
+}
+
+#[test]
+fn hosts_cannot_smuggle_url_syntax() {
+    // Userinfo would move the effective host past the `@`, pointing every
+    // request somewhere the user never configured.
+    for bad in [
+        "user@evil.example",
+        "127.0.0.1/../..",
+        "127.0.0.1:9999",
+        "host?q=1",
+        "host#frag",
+        "has space",
+        "",
+        "   ",
+    ] {
+        assert!(
+            matches!(CairnClient::new(bad, 8080, None), Err(Error::Invalid(_))),
+            "expected {bad:?} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn status_backed_code_when_body_is_not_a_cairn_envelope() {
+    // A proxy in front of cairn answers with its own 404 body; `is_not_found`
+    // must still recognise a missing entry.
+    let server = serve(|_| Response::json(404, "<html>nginx</html>"));
+    let err = client(&server.addr).archives().expect_err("must fail");
+    assert!(err.is_not_found(), "got {err}");
+    assert_eq!(err.status(), Some(404));
+
+    let server = serve(|_| Response::json(401, r#"{"detail":"nope"}"#));
+    let err = client(&server.addr).archives().expect_err("must fail");
+    assert!(err.is_unauthorized(), "got {err}");
+}

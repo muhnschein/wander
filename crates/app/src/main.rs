@@ -13,7 +13,9 @@ fn main() -> glib::ExitCode {
     app.connect_activate(|app| {
         let window = window::Window::new(app);
         window.present();
-        if settings::load().is_none() {
+        // Also covers a stored config that no longer yields a client, which the
+        // old file-presence check treated as configured and left unusable.
+        if !window.is_configured() {
             window.open_settings();
         }
     });

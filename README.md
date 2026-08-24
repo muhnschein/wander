@@ -13,12 +13,13 @@ GTK4 + libadwaita, written in Rust. Pre-alpha.
 
 - Connects to a cairn daemon over plain HTTP (`IP:PORT`), optionally with a
   bearer token; the address is configured in-app and stored under
-  `~/.config/wander/settings.conf`.
+  `~/.config/wander/settings.conf`, which is written `0600` because the token
+  is kept in plain text.
 - Lists every open archive (`GET /v1/archives`) as a library.
 - Renders entries in a sandboxed WebKit view through a private `cairn://`
   URI scheme: `cairn://{uuid}/{path}` is fetched from the daemon on demand,
-  so archived pages keep their relative links, images and stylesheets while
-  never touching the real network.
+  so archived pages keep their relative links, images and stylesheets.
+- Back and forward through the entries you have followed within an archive.
 - Title-prefix search in the open archive, wired to cairn's `/suggest`.
 - One random article, whenever you feel lucky.
 - External links are blocked by default and only opened after an explicit
@@ -26,10 +27,16 @@ GTK4 + libadwaita, written in Rust. Pre-alpha.
 - JavaScript is disabled in the reader. Archived pages are untrusted markup;
   cairn does not sanitize, so Wander keeps them on an isolated origin with
   scripting off and no persistent website data (ephemeral network session).
+- Nothing in the reader reaches the network. Blocking external *navigation*
+  is not enough — an archived page carrying an absolute `https://` image or
+  stylesheet would load it as a subresource, which no navigation policy sees
+  — so the reader's network session is additionally pointed at a dead local
+  proxy. Entries still arrive, because a registered `cairn://` handler is
+  served inside the web process and never reaches the networking stack.
 
 ## What it does not do (yet)
 
-- History, bookmarks, tabs, table of contents, print.
+- A history list, bookmarks, tabs, table of contents, print.
 - Full-text search: cairn 1.x offers none; Wander inherits that gap.
 - Anything but reading. There is no download manager, no catalogue, no OPDS.
 
@@ -46,6 +53,13 @@ the whole workspace inside a Debian trixie container via podman:
 
 ```console
 $ ci/container-test.sh
+```
+
+`cairn-client` has no GTK linkage, so it builds and tests on its own anywhere
+Rust runs:
+
+```console
+$ cargo test -p cairn-client
 ```
 
 ## Running
