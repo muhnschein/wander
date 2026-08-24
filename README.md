@@ -20,6 +20,10 @@ GTK4 + libadwaita, written in Rust. Pre-alpha.
   URI scheme: `cairn://{uuid}/{path}` is fetched from the daemon on demand,
   so archived pages keep their relative links, images and stylesheets.
 - Back and forward through the entries you have followed within an archive.
+- A table of contents for the open entry. JavaScript is disabled, so the
+  outline is read out of the stored HTML rather than asked of the page;
+  MediaWiki's `[edit]` links are kept out of the headings.
+- Find on page (Ctrl+F), with a match count.
 - Title-prefix search in the open archive, wired to cairn's `/suggest`.
 - One random article, whenever you feel lucky.
 - External links are blocked by default and only opened after an explicit
@@ -36,7 +40,7 @@ GTK4 + libadwaita, written in Rust. Pre-alpha.
 
 ## What it does not do (yet)
 
-- A history list, bookmarks, tabs, table of contents, print.
+- A history list, bookmarks, tabs, print.
 - Full-text search: cairn 1.x offers none; Wander inherits that gap.
 - Anything but reading. There is no download manager, no catalogue, no OPDS.
 

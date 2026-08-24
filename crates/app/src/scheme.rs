@@ -1,5 +1,8 @@
+use crate::toc::{self, Heading};
 use cairn_client::CairnClient;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub const SCHEME: &str = "cairn";
@@ -32,24 +35,71 @@ pub fn entry_uri(uuid: &str, path: &str) -> String {
     )
 }
 
+/// Headings of recently fetched HTML entries, keyed by entry path.
+///
+/// The reader cannot ask the page for its outline — JavaScript is disabled —
+/// so the scheme handler records it in passing, off bytes it has already
+/// fetched, and the reader reads it back once the load finishes. Bounded
+/// because a long browsing session would otherwise accumulate every page.
+/// Cached outlines keyed by entry path, oldest first.
+type Outlines = Vec<(String, Rc<Vec<Heading>>)>;
+
+#[derive(Clone, Default)]
+pub struct HeadingStore(Rc<RefCell<Outlines>>);
+
+impl HeadingStore {
+    const CAPACITY: usize = 16;
+
+    fn insert(&self, path: &str, headings: Vec<Heading>) {
+        let mut entries = self.0.borrow_mut();
+        entries.retain(|(known, _)| known != path);
+        entries.push((path.to_string(), Rc::new(headings)));
+        let overflow = entries.len().saturating_sub(Self::CAPACITY);
+        entries.drain(..overflow);
+    }
+
+    pub fn get(&self, path: &str) -> Option<Rc<Vec<Heading>>> {
+        self.0
+            .borrow()
+            .iter()
+            .find(|(known, _)| known == path)
+            .map(|(_, headings)| headings.clone())
+    }
+}
+
+/// Build the URI addressing `path` within `uuid`, scrolled to `fragment`.
+///
+/// The fragment is escaped with the same set as the path: an `id` taken from
+/// archived markup may hold spaces or non-ASCII, which would otherwise not
+/// survive as a URI fragment.
+pub fn entry_uri_with_fragment(uuid: &str, path: &str, fragment: &str) -> String {
+    format!(
+        "{}#{}",
+        entry_uri(uuid, path),
+        utf8_percent_encode(fragment, URI_PATH_SET)
+    )
+}
+
 pub fn install(
     context: &webkit::WebContext,
     client: Arc<CairnClient>,
     uuid: String,
     main_page: Option<String>,
+    headings: HeadingStore,
 ) {
     context.register_uri_scheme(SCHEME, move |request: &webkit::URISchemeRequest| {
         let request = request.clone();
         let client = client.clone();
         let uuid = uuid.clone();
         let main_page = main_page.clone();
+        let headings = headings.clone();
         glib::spawn_future_local(async move {
             let Some(uri) = request.uri() else {
                 fail(&request, "scheme request has no URI");
                 return;
             };
             match resolve(client, uuid, main_page, uri.as_str()).await {
-                Ok(entry) => finish(request, entry),
+                Ok(entry) => finish(request, entry, &headings),
                 Err(message) => fail(&request, &message),
             }
         });
@@ -68,7 +118,7 @@ pub fn install(
 /// same however they are decorated; failing the load instead would leave the
 /// reader on a blank page. Splitting before percent-decoding means a literal
 /// `%3F` inside a stored path survives as part of the path.
-fn parse_target(uri: &str) -> Option<String> {
+pub fn parse_target(uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("cairn://")?;
     let raw_path = rest.split_once('/').map(|(_, p)| p).unwrap_or("");
     let raw_path = raw_path.split(['#', '?']).next().unwrap_or("");
@@ -106,7 +156,7 @@ async fn resolve(
     }
 }
 
-fn finish(request: webkit::URISchemeRequest, entry: cairn_client::Entry) {
+fn finish(request: webkit::URISchemeRequest, entry: cairn_client::Entry, store: &HeadingStore) {
     let mime = entry
         .content_type
         .split(';')
@@ -114,6 +164,15 @@ fn finish(request: webkit::URISchemeRequest, entry: cairn_client::Entry) {
         .unwrap_or("application/octet-stream")
         .trim()
         .to_string();
+    if mime.eq_ignore_ascii_case("text/html") || mime.eq_ignore_ascii_case("application/xhtml+xml")
+    {
+        // Lossy is right here: an entry that is not valid UTF-8 should still
+        // render, and a mangled byte can at worst spoil one heading's text.
+        store.insert(
+            &entry.path,
+            toc::headings(&String::from_utf8_lossy(&entry.bytes)),
+        );
+    }
     let bytes = glib::Bytes::from_owned(entry.bytes);
     let stream = gio::MemoryInputStream::from_bytes(&bytes);
     request.finish(&stream, bytes.len() as i64, Some(&mime));
@@ -250,8 +309,80 @@ mod tests {
     }
 
     #[test]
+    fn a_fragment_uri_still_addresses_the_same_entry() {
+        let uri = super::entry_uri_with_fragment(UUID, "A/Vienna/Ring.html", "Early life");
+        assert_eq!(
+            uri,
+            format!("cairn://{UUID}/A/Vienna/Ring.html#Early%20life")
+        );
+        // The fragment must not change which entry gets fetched.
+        assert_eq!(parse_target(&uri).as_deref(), Some("A/Vienna/Ring.html"));
+    }
+
+    #[test]
     fn foreign_schemes_are_refused() {
         assert!(parse_target("https://example.org/A/Ring.html").is_none());
         assert!(parse_target("file:///etc/passwd").is_none());
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::HeadingStore;
+    use crate::toc::Heading;
+
+    fn outline(text: &str) -> Vec<Heading> {
+        vec![Heading {
+            level: 2,
+            text: text.to_string(),
+            anchor: None,
+        }]
+    }
+
+    #[test]
+    fn an_outline_comes_back_for_its_own_path() {
+        let store = HeadingStore::default();
+        store.insert("A/One.html", outline("One"));
+        store.insert("A/Two.html", outline("Two"));
+        assert_eq!(store.get("A/One.html").unwrap()[0].text, "One");
+        assert_eq!(store.get("A/Two.html").unwrap()[0].text, "Two");
+        assert!(store.get("A/Missing.html").is_none());
+    }
+
+    #[test]
+    fn revisiting_a_path_replaces_rather_than_duplicates() {
+        let store = HeadingStore::default();
+        store.insert("A/One.html", outline("Before"));
+        store.insert("A/One.html", outline("After"));
+        assert_eq!(store.get("A/One.html").unwrap()[0].text, "After");
+        assert_eq!(store.0.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_cache_stays_bounded_and_evicts_the_oldest() {
+        let store = HeadingStore::default();
+        for i in 0..HeadingStore::CAPACITY + 5 {
+            store.insert(&format!("A/{i}.html"), outline(&i.to_string()));
+        }
+        assert_eq!(store.0.borrow().len(), HeadingStore::CAPACITY);
+        // The first five are gone; the most recent survive.
+        assert!(store.get("A/0.html").is_none());
+        assert!(store.get("A/4.html").is_none());
+        assert!(store.get("A/5.html").is_some());
+        assert!(
+            store
+                .get(&format!("A/{}.html", HeadingStore::CAPACITY + 4))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_empty_outline_is_still_a_recorded_answer() {
+        // Distinguishes "this page has no headings" from "not fetched yet",
+        // which is what stops the sidebar flickering on an outline-less page.
+        let store = HeadingStore::default();
+        store.insert("A/Plain.html", Vec::new());
+        assert!(store.get("A/Plain.html").is_some_and(|o| o.is_empty()));
+        assert!(store.get("A/Other.html").is_none());
     }
 }

@@ -78,21 +78,25 @@ impl Window {
         stack.add_named(&status, Some("status"));
         stack.set_visible_child_name("status");
 
+        // The header belongs to the library page, not to the window. Hung off
+        // the window it stays put while a reader page is pushed over it,
+        // leaving two stacked header bars, two sets of window controls, and a
+        // refresh button for a library nobody is looking at.
+        let library_toolbar = adw::ToolbarView::new();
+        library_toolbar.add_top_bar(&header);
+        library_toolbar.set_content(Some(&stack));
+
         let nav = adw::NavigationView::new();
         let library_page = adw::NavigationPage::builder()
             .title("Wander")
-            .child(&stack)
+            .child(&library_toolbar)
             .build();
         nav.add(&library_page);
 
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&nav));
 
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&header);
-        toolbar.set_content(Some(&toasts));
-
-        win.set_content(Some(&toolbar));
+        win.set_content(Some(&toasts));
 
         let window = Self {
             win,
@@ -254,15 +258,17 @@ fn archive_row(state: &Weak<State>, archive: ArchiveSummary) -> gtk::Widget {
         subtitle.push_str(" · searchable");
     }
 
+    // Titles come out of the ZIM file, and an ActionRow renders them as Pango
+    // markup by default: an archive called "Arts & Crafts" fails to parse and
+    // renders empty. Markup has to be turned off *before* the title is set —
+    // supplying it to the builder means it is parsed on the way in, warning and
+    // mangling the text before any later call can take effect.
     let row = adw::ActionRow::builder()
-        .title(&archive.title)
         .subtitle(subtitle)
         .activatable(true)
         .build();
-    // Titles come out of the ZIM file, and an ActionRow renders them as Pango
-    // markup by default: an archive called "Arts & Crafts" would otherwise fail
-    // to parse and render as an empty row.
     row.set_use_markup(false);
+    row.set_title(&archive.title);
     row.set_tooltip_text(Some(&archive.uuid));
 
     let state = state.clone();

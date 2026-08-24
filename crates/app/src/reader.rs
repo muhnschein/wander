@@ -1,4 +1,5 @@
 use crate::scheme;
+use crate::toc::Heading;
 use adw::prelude::*;
 use cairn_client::{ArchiveSummary, CairnClient};
 use std::cell::{Cell, RefCell};
@@ -16,7 +17,14 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
     let context = webkit::WebContext::new();
     let session = webkit::NetworkSession::new_ephemeral();
     block_outbound_network(&session);
-    scheme::install(&context, client.clone(), uuid.clone(), main_page.clone());
+    let headings = scheme::HeadingStore::default();
+    scheme::install(
+        &context,
+        client.clone(),
+        uuid.clone(),
+        main_page.clone(),
+        headings.clone(),
+    );
 
     let view = webkit::WebView::builder()
         .web_context(&context)
@@ -50,16 +58,80 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
     search_entry.set_placeholder_text(Some("Find article…"));
     header.set_title_widget(Some(&search_entry));
 
+    let toc_button = gtk::ToggleButton::new();
+    toc_button.set_icon_name("view-list-symbolic");
+    toc_button.set_tooltip_text(Some("Table of contents"));
+    toc_button.set_sensitive(false);
+    header.pack_start(&toc_button);
+
     let random_button = gtk::Button::from_icon_name("media-playlist-shuffle-symbolic");
     random_button.set_tooltip_text(Some("Random article"));
     header.pack_end(&random_button);
 
+    let find_button = gtk::ToggleButton::new();
+    find_button.set_icon_name("edit-find-symbolic");
+    find_button.set_tooltip_text(Some("Find on page (Ctrl+F)"));
+    header.pack_end(&find_button);
+
     let spinner = gtk::Spinner::new();
     header.pack_end(&spinner);
 
+    let toc_list = gtk::ListBox::new();
+    toc_list.set_selection_mode(gtk::SelectionMode::None);
+    toc_list.add_css_class("navigation-sidebar");
+    let toc_scroll = gtk::ScrolledWindow::new();
+    toc_scroll.set_child(Some(&toc_list));
+    toc_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    toc_scroll.set_vexpand(true);
+
+    let sidebar = adw::ToolbarView::new();
+    let sidebar_header = adw::HeaderBar::new();
+    sidebar_header.set_show_end_title_buttons(false);
+    sidebar_header.set_title_widget(Some(&gtk::Label::new(Some("Contents"))));
+    sidebar.add_top_bar(&sidebar_header);
+    sidebar.set_content(Some(&toc_scroll));
+
+    let split = adw::OverlaySplitView::new();
+    split.set_sidebar(Some(&sidebar));
+    split.set_content(Some(&view));
+    split.set_show_sidebar(false);
+    split.set_max_sidebar_width(320.0);
+    split
+        .bind_property("show-sidebar", &toc_button, "active")
+        .bidirectional()
+        .sync_create()
+        .build();
+
+    let find_entry = gtk::SearchEntry::new();
+    find_entry.set_placeholder_text(Some("Find on page…"));
+    find_entry.set_hexpand(true);
+    let matches_label = gtk::Label::new(None);
+    matches_label.add_css_class("dim-label");
+    let find_prev = gtk::Button::from_icon_name("go-up-symbolic");
+    find_prev.set_tooltip_text(Some("Previous match"));
+    let find_next = gtk::Button::from_icon_name("go-down-symbolic");
+    find_next.set_tooltip_text(Some("Next match"));
+    let find_nav = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    find_nav.add_css_class("linked");
+    find_nav.append(&find_prev);
+    find_nav.append(&find_next);
+    let find_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    find_box.append(&find_entry);
+    find_box.append(&matches_label);
+    find_box.append(&find_nav);
+    let find_bar = gtk::SearchBar::new();
+    find_bar.set_child(Some(&find_box));
+    find_bar.connect_entry(&find_entry);
+    find_bar
+        .bind_property("search-mode-enabled", &find_button, "active")
+        .bidirectional()
+        .sync_create()
+        .build();
+
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&view));
+    toolbar.add_top_bar(&find_bar);
+    toolbar.set_content(Some(&split));
 
     let popover = gtk::Popover::new();
     let results = gtk::ListBox::new();
@@ -76,6 +148,10 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
         results: results.clone(),
         paths: RefCell::new(Vec::new()),
         generation: Cell::new(0),
+        headings,
+        toc_list: toc_list.clone(),
+        anchors: RefCell::new(Vec::new()),
+        current_path: RefCell::new(String::new()),
     });
 
     // A popover parented to a widget is not owned by it: without this GTK warns
@@ -152,13 +228,63 @@ pub fn reader_page(client: Arc<CairnClient>, archive: ArchiveSummary) -> adw::Na
     let back = back_button.clone();
     let forward = forward_button.clone();
     let spin = spinner.clone();
-    view.connect_load_changed(move |view, _| {
+    let toc_ui = ui.clone();
+    let toc_toggle = toc_button.clone();
+    view.connect_load_changed(move |view, event| {
         back.set_sensitive(view.can_go_back());
         forward.set_sensitive(view.can_go_forward());
         let loading = view.is_loading();
         spin.set_visible(loading);
         spin.set_spinning(loading);
+        if event == webkit::LoadEvent::Finished {
+            refresh_outline(&toc_ui, &toc_toggle);
+        }
     });
+
+    let jump_ui = ui.clone();
+    toc_list.connect_row_activated(move |_, row| {
+        let index = row.index();
+        if index < 0 {
+            return;
+        }
+        let anchor = jump_ui
+            .anchors
+            .borrow()
+            .get(index as usize)
+            .cloned()
+            .flatten();
+        let Some(anchor) = anchor else {
+            return;
+        };
+        let path = jump_ui.current_path.borrow().clone();
+        jump_ui.view.load_uri(&scheme::entry_uri_with_fragment(
+            &jump_ui.uuid,
+            &path,
+            &anchor,
+        ));
+    });
+
+    install_find(
+        &view,
+        &find_bar,
+        &find_entry,
+        &matches_label,
+        &find_prev,
+        &find_next,
+    );
+
+    // Ctrl+F reveals the find bar; SearchBar handles Escape to dismiss it.
+    let shortcuts = gtk::ShortcutController::new();
+    shortcuts.set_scope(gtk::ShortcutScope::Managed);
+    let reveal = find_bar.clone();
+    shortcuts.add_shortcut(gtk::Shortcut::new(
+        gtk::ShortcutTrigger::parse_string("<Control>f"),
+        Some(gtk::CallbackAction::new(move |_, _| {
+            reveal.set_search_mode(true);
+            glib::Propagation::Stop
+        })),
+    ));
+    toolbar.add_controller(shortcuts);
 
     view.connect_load_failed(|view, _, uri, error| {
         // The scheme handler already turned a cairn error into this message;
@@ -190,6 +316,13 @@ struct ReaderUi {
     /// carry no payload of their own, so this is what an activated row maps to.
     paths: RefCell<Vec<String>>,
     generation: Cell<u64>,
+    headings: scheme::HeadingStore,
+    toc_list: gtk::ListBox,
+    /// Anchor for each row in `toc_list`, parallel by index; `None` for a
+    /// heading the archive gave no id, which can be listed but not jumped to.
+    anchors: RefCell<Vec<Option<String>>>,
+    /// Entry path currently displayed, so an outline jump knows what to reload.
+    current_path: RefCell<String>,
 }
 
 /// Fail every real network load in this session closed.
@@ -265,6 +398,126 @@ fn load_entry(ui: &ReaderUi, path: &str) {
     ui.view.load_uri(&scheme::entry_uri(&ui.uuid, path));
 }
 
+/// Rebuild the sidebar from whatever outline the scheme handler recorded for
+/// the entry now on screen, and enable the toggle only when there is one.
+fn refresh_outline(ui: &Rc<ReaderUi>, toggle: &gtk::ToggleButton) {
+    while let Some(child) = ui.toc_list.first_child() {
+        ui.toc_list.remove(&child);
+    }
+    ui.anchors.borrow_mut().clear();
+
+    let path = ui
+        .view
+        .uri()
+        .and_then(|uri| scheme::parse_target(&uri))
+        .unwrap_or_default();
+    *ui.current_path.borrow_mut() = path.clone();
+
+    let outline = ui.headings.get(&path).unwrap_or_default();
+    // A lone title is not an outline worth a sidebar for.
+    if outline.len() < 2 {
+        toggle.set_sensitive(false);
+        toggle.set_active(false);
+        return;
+    }
+
+    let mut anchors = ui.anchors.borrow_mut();
+    // Indent relative to the shallowest heading present, so a page whose
+    // sections start at h2 is not uniformly indented.
+    let top = outline.iter().map(|h| h.level).min().unwrap_or(1);
+    for heading in outline.iter() {
+        ui.toc_list.append(&outline_row(heading, top));
+        anchors.push(heading.anchor.clone());
+    }
+    drop(anchors);
+    toggle.set_sensitive(true);
+}
+
+fn outline_row(heading: &Heading, top: u8) -> gtk::ListBoxRow {
+    let label = gtk::Label::new(Some(&heading.text));
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    // Headings are archive text, never markup.
+    label.set_use_markup(false);
+    label.set_margin_top(6);
+    label.set_margin_bottom(6);
+    label.set_margin_end(12);
+    label.set_margin_start(12 + 12 * i32::from(heading.level.saturating_sub(top)));
+    if heading.level == top {
+        label.add_css_class("heading");
+    }
+
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&label));
+    // A heading with no id cannot be scrolled to, so it reads as a label.
+    row.set_activatable(heading.anchor.is_some());
+    row.set_selectable(false);
+    row
+}
+
+fn install_find(
+    view: &webkit::WebView,
+    bar: &gtk::SearchBar,
+    entry: &gtk::SearchEntry,
+    matches: &gtk::Label,
+    previous: &gtk::Button,
+    next: &gtk::Button,
+) {
+    let Some(controller) = view.find_controller() else {
+        bar.set_sensitive(false);
+        return;
+    };
+    let options = (webkit::FindOptions::CASE_INSENSITIVE | webkit::FindOptions::WRAP_AROUND).bits();
+    const MAX_MATCHES: u32 = 1000;
+
+    let find = controller.clone();
+    let label = matches.clone();
+    entry.connect_search_changed(move |entry| {
+        let text = entry.text();
+        if text.is_empty() {
+            find.search_finish();
+            label.set_text("");
+            return;
+        }
+        find.search(&text, options, MAX_MATCHES);
+        find.count_matches(&text, options, MAX_MATCHES);
+    });
+
+    let find = controller.clone();
+    previous.connect_clicked(move |_| find.search_previous());
+    let find = controller.clone();
+    next.connect_clicked(move |_| find.search_next());
+    let find = controller.clone();
+    entry.connect_activate(move |_| find.search_next());
+
+    let label = matches.clone();
+    controller.connect_counted_matches(move |_, count| {
+        label.set_text(&match count {
+            0 => String::new(),
+            n if n >= MAX_MATCHES => format!("{MAX_MATCHES}+ matches"),
+            1 => "1 match".to_string(),
+            n => format!("{n} matches"),
+        });
+    });
+
+    let label = matches.clone();
+    controller.connect_failed_to_find_text(move |_| label.set_text("No matches"));
+
+    // Leaving the bar must clear the highlight, or it persists over the page.
+    let find = controller.clone();
+    let entry = entry.clone();
+    let label = matches.clone();
+    bar.connect_search_mode_enabled_notify(move |bar| {
+        if bar.is_search_mode() {
+            entry.grab_focus();
+        } else {
+            find.search_finish();
+            label.set_text("");
+        }
+    });
+}
+
 /// Post a message on the window's toast overlay, if the widget is in one.
 fn toast(widget: &impl IsA<gtk::Widget>, message: &str) {
     if let Some(overlay) = widget
@@ -286,8 +539,9 @@ fn clear_results(ui: &ReaderUi) {
 /// Show a single non-activatable row in the suggestion popover.
 fn show_notice(ui: &ReaderUi, message: &str) {
     clear_results(ui);
-    let row = adw::ActionRow::builder().title(message).build();
+    let row = adw::ActionRow::builder().build();
     row.set_use_markup(false);
+    row.set_title(message);
     row.add_css_class("dim-label");
     ui.results.append(&row);
     ui.popover.popup();
@@ -301,14 +555,13 @@ fn show_suggestions(ui: &ReaderUi, suggestions: Vec<cairn_client::Suggestion>) {
     }
     let mut paths = ui.paths.borrow_mut();
     for suggestion in suggestions {
-        let row = adw::ActionRow::builder()
-            .title(&suggestion.title)
-            .subtitle(&suggestion.path)
-            .activatable(true)
-            .build();
-        // Suggestion titles and paths come from the archive; an ActionRow would
-        // otherwise render them as Pango markup and drop any containing `&`.
+        // Suggestion titles and paths come from the archive, so markup has to
+        // be off before either is set; the builder would parse them on the way
+        // in and drop any title containing `&`.
+        let row = adw::ActionRow::builder().activatable(true).build();
         row.set_use_markup(false);
+        row.set_title(&suggestion.title);
+        row.set_subtitle(&suggestion.path);
         ui.results.append(&row);
         paths.push(suggestion.path);
     }
